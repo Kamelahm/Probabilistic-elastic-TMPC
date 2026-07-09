@@ -84,9 +84,9 @@ constraints = []
 # (8d)  kappa >= ||C_A||_2 + sum_i s_i ||G_A^(i)||_2
 norms_GA = np.array([np.linalg.norm(g[0], 2) for g in generators])
 constraints.append(kappa >= cp.norm(C_A, 2) + s_zon @ norms_GA)
- 
-# (8c)+(8e)  Z_v = diag(z_v) with z_v = t  ->  Schur LMI gives
-#            Sigma_kappa >= diag(t^2). This is the operative covariance bound.
+
+# (8c)+(8e)  Z_v = diag(t) ->  Schur LMI gives
+#            Sigma_kappa >= diag(t^2).
 Z_v = cp.diag(t)
 constraints.append(cp.bmat([[Sigma_kappa, Z_v],
                             [Z_v.T,        np.eye(n)]]) >> 0)
@@ -108,7 +108,8 @@ constraints.append(cp.abs(R - c_omega_bc - Gl) + term2 <= eta * t_bc)
  
 
 constraints.append(cp.square(t) <= cp.diag(Sigma_kappa))
- 
+
+
 # ----------------------------------------------------------------------- #
 #  7. Objective (8a)                                                      #
 # ----------------------------------------------------------------------- #
