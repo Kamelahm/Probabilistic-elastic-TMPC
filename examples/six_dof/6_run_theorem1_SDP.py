@@ -67,7 +67,6 @@ C_A         = cp.Variable((n, n))
 C_B         = cp.Variable((n, m))
 s_zon       = cp.Variable(q,  nonneg=True)
 kappa       = cp.Variable(nonneg=True)
-z_v         = cp.Variable(n,  nonneg=True)
 Sigma_kappa = cp.Variable((n, n), PSD=True)
 c_omega     = cp.Variable(n)
 lambdas     = cp.Variable((s_omega, T))
@@ -94,7 +93,7 @@ norms_GA = np.array([np.linalg.norm(g[0], 2) for g in generators])
 constraints.append(kappa >= cp.norm(C_A, 2) + s_zon @ norms_GA)
 
 # (8e) LMI
-Z_v = cp.diag(z_v)
+Z_v = cp.diag(t)
 constraints.append(cp.bmat([[Sigma_kappa, Z_v], [Z_v.T, np.eye(n)]]) >> 0)
 
 # lambda box
@@ -149,7 +148,6 @@ A_id, B_id      = C_A.value, C_B.value
 s_star          = np.maximum(s_zon.value, 0)
 Sigma_kappa_val = Sigma_kappa.value
 c_omega_val     = c_omega.value
-z_v_val         = z_v.value
 kappa_val       = float(kappa.value)
 
 print(f"\n[Identified center]")
@@ -172,7 +170,7 @@ identified = {
     "A_id": A_id, "B_id": B_id,
     "s_star": s_star, "Sigma_kappa": Sigma_kappa_val,
     "c_omega": c_omega_val, "G_omega": G_omega,
-    "kappa": kappa_val, "z_v": z_v_val,
+    "kappa": kappa_val, 
     "generators": generators, "eta": eta, "delta": delta,
 }
 out = p_d / "identified_model.pckl"
