@@ -56,9 +56,6 @@ class DDElasticTubeSimulator(BaseSimulator):
             cs, rs = self.get_corridor_balls(
                 path_traj, path_centers, path_radii, p_g)
             # Polytopes: the safe regions actually enforced by the MPC.
-            # Position is unbounded in Y (H_y_pos / h_y_pos = None); the corridor
-            # is the only position constraint, and is contained in the
-            # obstacle-free configuration space by construction.
             corr_H, corr_h, corr_centers = get_corridor_polytopes(
                 self, path_traj, path_centers, path_radii, p_g,
                 H_y_pos=None, h_y_pos=None)
@@ -136,8 +133,8 @@ class DDElasticTubeSimulator(BaseSimulator):
                 status = "success"
                 break
 
-            # ---- Diagnostic: print progress every 50 steps ----
-            if ts % 50 == 0:
+            # ---- Diagnostic: print progress every 100 steps ----
+            if ts % 100 == 0:
                 dist_to_goal_pos = np.linalg.norm(x[:m_p] - p_g)
                 dist_y_bar = np.linalg.norm(y_bar[:m_p] - p_g)
                 err_norm = np.linalg.norm(x - y_bar)
