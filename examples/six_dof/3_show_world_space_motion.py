@@ -18,6 +18,7 @@ import pickle
 import numpy as np
 import trimesh
 
+from aux import interpolate_equidistant
 from examples.six_dof import P_EXAMPLE_6_DOF_DATA
 from examples.six_dof.manipulator.man import DemoManipulator
 from examples.six_dof.misc.vis import render_path
@@ -78,17 +79,6 @@ world = DemoWorld()
 q_s, q_g = world.get_demo_query()
 man = DemoManipulator()
 
-############################################
-q_final = Xs[-1][:6]
-T_final, = man.get_link_fk(q_final, links=["link_6"])
-
-q_g = np.r_[0.6, np.pi / 4, np.pi / 2, np.zeros(3,)]  
-T_goal, = man.get_link_fk(q_g, links=["link_6"])
-
-print("final EE position:", T_final[:3, -1])
-print("goal  EE position:", T_goal[:3, -1])
-print("EE distance to goal:", np.linalg.norm(T_final[:3, -1] - T_goal[:3, -1]))
-############################################
 
 scene = trimesh.Scene(
     [
