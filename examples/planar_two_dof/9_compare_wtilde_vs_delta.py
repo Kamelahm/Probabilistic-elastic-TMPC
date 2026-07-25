@@ -1,17 +1,20 @@
 """
-Numerical illustration of the advantage of Theorem 1 (data-driven set-membership
-identification of the post-feedback-linearization dynamics) over the analytical
-flexible bound beta(x,a) of Proposition 1 in Wullt et al. (2026).
+Numerical comparison for Table 1 / Fig. 1, REGION ROUTE.
 
-Effective-noise model (no separate process disturbance):
-    omega_k := B*Delta_theta(x_k,u_k) + Delta_disc(x_k,u_k)        (the discrepancy IS omega_k)
-    w_tilde_k = upsilon_{k+1} - A* upsilon_k + omega_k             (measurement noise + omega_k)
+Two comparisons are reported, because they answer different questions:
 
-Both descriptions are compared in the SAME P-weighted norm, along the SAME
-persistently-exciting trajectory, where P is the contraction metric obtained
-from the App.-B SDP for this plant.
+  (I)  DISCREPANCY ONLY -- apples to apples.
+       beta(x,u) of Prop. 1 in Wullt et al. bounds the model discrepancy
+       B*Delta_theta + Delta_disc using EXACT states.  The corresponding
+       quantity here is the calibrated process-disturbance bound omega_bar,
+       which by Section V-B is that same discrepancy.  Both are then
+       compared in the same P-weighted norm.
 
-Outputs: fig1_residual_sets.png + summary.txt
+  (II) FULL EFFECTIVE UNCERTAINTY -- what the controller actually carries.
+       Z_wtilde must additionally cover the measurement-noise propagation
+       upsilon_{k+1} - A* upsilon_k at the STATED confidence eta_a (~4.5 sigma),
+       so it is necessarily larger than beta, which omits noise entirely.
+
 """
 import os, itertools
 from pathlib import Path
@@ -19,6 +22,7 @@ import numpy as np
 import cvxpy as cp
 from scipy.stats import norm
 from scipy.linalg import sqrtm
+from scipy.optimize import linprog
 from scipy.integrate import solve_ivp
 import matplotlib
 matplotlib.use("Agg")
@@ -33,8 +37,16 @@ except NameError:
 OUT_DIR = Path(os.environ.get("THM1_OUT_DIR", _here / "figures"))
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
+# ---------------------------------------------------------------- switches --
+ISOTROPIC   = True      # [6] True = paper's Assumption 2 verbatim
+KAPPA       = 1.01       # [1] a priori spectral bound, FIXED
+DELTA_A     = 0.05
+K_BAR       = 500        # [3] closed-loop horizon entering eta_a
+SAFETY      = 2.0        # [5] margin on the calibrated omega_bar
+OMEGA_FLOOR = 1e-8
+
 # ======================================================================
-# 1. Manipulator model (2-DOF planar, revolute, gravity in the plane)
+# 1. Manipulator model (unchanged)
 # ======================================================================
 G = 9.81
 def make_params(m1, m2, l1, l2, lc1f=0.5, lc2f=0.5):
@@ -62,7 +74,6 @@ def delta_theta(q, qd, u, pt, pn):
     M11,M12,M22=Mmat(q2,pt); C1,C2=Cqd(q2,qd1,qd2,pt); g1,g2=gvec(q1,q2,pt)
     r1,r2=tau1-C1-g1,tau2-C2-g2; det=M11*M22-M12**2
     return np.stack([(M22*r1-M12*r2)/det-u[:,0], (-M12*r1+M11*r2)/det-u[:,1]], axis=1)
-# matrix forms (for the analytical constants)
 def Mfull(q2,p):
     M11,M12,M22=Mmat(np.array([q2]),p); return np.array([[M11[0],M12[0]],[M12[0],M22[0]]])
 def Cfull(q2,qd1,qd2,p):
@@ -81,12 +92,10 @@ def rk4_step(x, u, dt, nsub=10):
     return x
 
 # ======================================================================
-# 2. PE data collection.  NO separate process disturbance:
-#    omega_k IS the model discrepancy B*Delta_theta + Delta_disc, already
-#    present in the nonlinear rollout.  Only measurement noise is added.
+# 2. PE data collection (unchanged)
 # ======================================================================
 TS = 0.01
-EPS_P, EPS_V = 2e-4, 2e-3              # measurement-noise bounds (our setup)
+EPS_P, EPS_V = 2e-4, 2e-3
 U_MAX, Q_MAX, QD_MAX = 5.0, 1.2, 2.0
 A0 = np.block([[np.eye(2), TS*np.eye(2)], [np.zeros((2,2)), np.eye(2)]])
 B0 = np.vstack([TS**2/2*np.eye(2), TS*np.eye(2)])
@@ -98,14 +107,15 @@ def collect(T, seed, amp=0.7):
     qr  = np.stack([(A*np.sin(np.outer(t,w)+ph[i])).sum(1) for i in range(2)],1)
     qdr = np.stack([(A*w*np.cos(np.outer(t,w)+ph[i])).sum(1) for i in range(2)],1)
     qddr= np.stack([(-A*w**2*np.sin(np.outer(t,w)+ph[i])).sum(1) for i in range(2)],1)
-    x = np.r_[qr[0],qdr[0]]; X=np.zeros((T+1,4)); U=np.zeros((T,2)); Xtrue=np.zeros((T+1,4)); Xtrue[0]=x
+    x = np.r_[qr[0],qdr[0]]; X=np.zeros((T+1,4)); U=np.zeros((T,2))
+    Xtrue=np.zeros((T+1,4)); Xtrue[0]=x
     Vn = np.c_[r.normal(0.0, EPS_P, (T+1,2)), r.normal(0.0, EPS_V, (T+1,2))]
     for k in range(T):
         u = qddr[k]+80*(qr[k]-x[:2])+18*(qdr[k]-x[2:])+r.uniform(-.4,.4,2)
         u = np.clip(u,-U_MAX,U_MAX); U[k]=u
-        x = rk4_step(x,u,TS)                       # discrepancy enters here = omega_k
+        x = rk4_step(x,u,TS)
         Xtrue[k+1]=x
-    return Xtrue+Vn, U, Xtrue                       # measurement noise upsilon_k
+    return Xtrue+Vn, U, Xtrue
 
 print("Collecting PE data (no injected disturbance)...")
 T_id = 1500
@@ -115,11 +125,47 @@ Y0, Y1, U0 = X_id[:-1].T, X_id[1:].T, U_id.T
 n, m = Y0.shape[0], U0.shape[0]
 
 # ======================================================================
-# 3. Theorem-1 SDP.  Learned mixed-zonotope set: center c_omega + bounded
-#    zonotope G_omega*lambda_k (lambda_k learned, ||.||_inf<=1) + confidence
-#    eta*sqrt(Sigma_kappa).  G_omega is a fixed generator (no injected disturbance).
+# 3. [3][6] Lemma-2 envelope, and [5] calibration of omega_bar
 # ======================================================================
-print("Configuring SDP (Theorem 1)...")
+eta_a = norm.ppf(1.0 - DELTA_A/(2.0*n*(T_id + K_BAR)))
+
+sigma_vec = np.array([EPS_P, EPS_P, EPS_V, EPS_V])
+if ISOTROPIC:                       # Assumption 2 verbatim
+    sd = np.full(n, sigma_vec.max()*np.sqrt(1.0 + KAPPA**2))
+else:                               # per-coordinate: Var = e_i'(V + A V A')e_i
+    Vhat = np.diag(sigma_vec**2)
+    sd = np.sqrt(np.diag(Vhat + A0 @ Vhat @ A0.T))
+noise_hw = eta_a * sd               # measurement-noise half-widths
+
+# Chebyshev eps_min per row: min_Theta max_k |y_{k+1,a} - Theta z_k|  (one LP)
+Z0 = np.vstack([Y0, U0]); d = n + m
+A_ub = np.block([[Z0.T, -np.ones((T_id,1))],[-Z0.T, -np.ones((T_id,1))]])
+c_lp = np.zeros(d+1); c_lp[-1] = 1.0
+eps_min = np.array([
+    linprog(c_lp, A_ub=A_ub, b_ub=np.concatenate([Y1[a,:], -Y1[a,:]]),
+            bounds=[(None,None)]*d+[(0.0,None)], method="highs").x[-1]
+    for a in range(n)])
+# Assumption-3 prior bound.  The calibration deliberately does NOT subtract the
+# measurement envelope: eps_min bounds discrepancy AND noise jointly, and the two
+# are not separable from noisy data, so subtracting noise_hw returns zero wherever
+# noise dominates and yields an omega_bar that fails Assumption 3.  Taking
+# SAFETY*eps_min is conservative by construction (it double-counts noise) but is a
+# valid prior bound on the process disturbance.
+omega_bar = np.maximum(SAFETY*eps_min, OMEGA_FLOOR)
+eps_bar = omega_bar + noise_hw
+g = 2.0*omega_bar                    # fixed diagonal generator, |g_i| >= omega_bar_i
+G_omega = np.diag(g)
+
+print(f"[envelope] eta_a={eta_a:.4f}  isotropic={ISOTROPIC}")
+print(f"           noise half-widths = {noise_hw}")
+print(f"           eps_min           = {eps_min}")
+print(f"           omega_bar (calib) = {omega_bar}")
+print(f"           eps_bar           = {eps_bar}")
+
+# ======================================================================
+# 4. [1][2] Theorem-1 SDP, region route
+# ======================================================================
+print("Configuring SDP (Theorem 1, region route)...")
 generators = []
 for i in range(n):
     for j in range(n):
@@ -128,87 +174,71 @@ for i in range(n):
     for j in range(m):
         GB=np.zeros((n,m));GB[i,j]=1.0; generators.append((np.zeros((n,n)), GB))
 q = len(generators)
-delta_conf = 0.05
-eta = norm.ppf(1.0 - delta_conf/(2.0*n*T_id))
-
-# fixed bounded-zonotope generator G_omega (s_omega columns); lambda_k learned per step.
-s_omega = n
-
-G_omega = np.diag([2*EPS_P+TS*EPS_V, 2*EPS_P+TS*EPS_V, 2*EPS_V, 2*EPS_V])
-
-C_A=cp.Variable((n,n)); C_B=cp.Variable((n,m)); s_zon=cp.Variable(q,nonneg=True)
-kappa=cp.Variable(nonneg=True); z_v=cp.Variable(n,nonneg=True)
-Sigma_kappa=cp.Variable((n,n),PSD=True); c_omega=cp.Variable(n)
-lambdas=cp.Variable((s_omega, T_id))             # learned bounded activations, ||.||_inf<=1
 
 V = np.zeros((T_id, n, q))
 for k in range(T_id):
     for j,(GA,GB) in enumerate(generators):
         V[k,:,j] = GA@Y0[:,k] + GB@U0[:,k]
 
-cons = [kappa >= cp.norm(C_A,2) + s_zon @ np.array([np.linalg.norm(g[0],2) for g in generators])]
-cons.append(cp.bmat([[Sigma_kappa, cp.diag(z_v)], [cp.diag(z_v).T, np.eye(n)]]) >> 0)
+SB = sigma_vec.max()                            # nondimensionalisation scale
+C_A=cp.Variable((n,n)); C_B=cp.Variable((n,m))
+s_h=cp.Variable(q,nonneg=True)                  # s = SB * s_h
+Sig_h=cp.Variable((n,n),PSD=True)               # Sigma = SB^2 * Sig_h
+c_h=cp.Variable(n)                              # c_omega = SB * c_h
+t_h=cp.Variable(n,nonneg=True)
+lambdas=cp.Variable((n, T_id))
+
+cons  = [cp.bmat([[Sig_h, cp.diag(t_h)], [cp.diag(t_h), np.eye(n)]]) >> 0]
+cons += [cp.square(t_h) <= cp.diag(Sig_h)]
+cons += [Sig_h >> np.diag((sd / SB) ** 2)]
 cons += [lambdas <= 1, lambdas >= -1]
+
 for k in range(T_id):
-    r_k = Y1[:,k] - C_A@Y0[:,k] - C_B@U0[:,k]
+    r_k = (Y1[:,k] - C_A@Y0[:,k] - C_B@U0[:,k]) / SB
     for i in range(n):
-        # cons.append(cp.abs(r_k[i]) + s_zon @ np.abs(V[k,i,:])
-        #             + cp.abs(c_omega[i]) + cp.abs(G_omega[i,:] @ lambdas[:,k]) <= eta*z_v[i])
         cons.append(
-            cp.abs(r_k[i] - c_omega[i] - G_omega[i,:] @ lambdas[:,k]) 
-            <= eta*z_v[i] - s_zon @ np.abs(V[k,i,:])
+            cp.abs(r_k[i] - c_h[i] - (G_omega[i,:] @ lambdas[:,k])/SB)
+            <= eta_a*t_h[i] - (s_h @ np.abs(V[k,i,:]))
         )
+# [2] coverage (10h), in scaled units
+cons.append(eta_a*cp.sqrt(cp.diag(Sig_h))
+            >= eps_bar/SB + cp.abs(c_h) - np.abs(g)/SB)
 
-# 1. Keep the variance weight that gave you good physical noise bounds
-LAMBDA_SIGMA = 1e3
-
-# 2. Normalize the lambda penalty so it doesn't artificially scale by 1500
-LAMBDA_LAMBDA = 1.0 / T_id 
-
-# 3. Create the balanced objective function
-obj = (cp.sum(s_zon) 
-       + LAMBDA_SIGMA * cp.trace(Sigma_kappa)
-       + LAMBDA_LAMBDA * cp.sum([cp.norm(lambdas[:,k],1) for k in range(T_id)]))
-
+obj = (cp.sum(s_h) + cp.trace(Sig_h)
+       + cp.sum(cp.abs(lambdas))/T_id)
 print("Solving SDP...")
-# 4. Slightly relax Clarabel's absolute tolerance to clear the numerical warning
-cp.Problem(cp.Minimize(obj), cons).solve(
-    solver=cp.CLARABEL, 
-    tol_gap_abs=1e-6, 
-    tol_gap_rel=1e-6, 
-    max_iter=100, 
-    verbose=False
-)
-
-# obj = (cp.sum(s_zon) + cp.trace(Sigma_kappa)
-#        + cp.sum([cp.norm(lambdas[:,k],1) for k in range(1,T_id)]))
-# print("Solving SDP...")
-# cp.Problem(cp.Minimize(obj), cons).solve(solver=cp.CLARABEL, verbose=False)
+cp.Problem(cp.Minimize(obj), cons).solve(solver=cp.CLARABEL, verbose=False)
 
 A_hat, B_hat = C_A.value, C_B.value
-s_star = np.maximum(s_zon.value, 0.0)
-c_om, Sig = c_omega.value, Sigma_kappa.value
-print(f"-> active s_i={int((s_star>1e-6).sum())}/{q}, sum(s*)={s_star.sum():.3e}")
+s_star = np.maximum(s_h.value, 0.0)*SB
+Sig    = Sig_h.value*SB**2
+c_om   = c_h.value*SB
+print(f"-> active s_i={int((s_star>1e-9).sum())}/{q}, sum(s*)={s_star.sum():.3e}"
+      f"   (s* -> 0 is expected: nothing bounds M from below)")
 
-# ---- effective-noise set Z_wtilde = <c_omega, G_omega, I_n, 0, Sigma_kappa>_MZ ----
-mz_axis = (s_star[None,None,:]*np.abs(V)).sum(2).max(0)   # matrix-zonotope spread
-dz_axis = np.abs(G_omega).sum(1)                          # bounded zonotope half-width
-D_kappa = eta*np.sqrt(np.maximum(np.diag(Sig),0.0))       # confidence half-width
-c_dd  = c_om.copy()
-hw_dd = mz_axis + dz_axis + D_kappa
-G_dd  = np.diag(hw_dd)
+# [4] Z_wtilde confidence-region half-widths
+D_kappa = eta_a*np.sqrt(np.maximum(np.diag(Sig),0.0))
+hw_dd   = np.abs(g) + D_kappa
+c_dd    = c_om.copy()
+print(f"[Z_wtilde] h_wtilde = {hw_dd}")
+print(f"           eps_bar  = {eps_bar}   -> coverage binds: "
+      f"{np.allclose(hw_dd, eps_bar, rtol=1e-3)}")
+
 def residuals(X,U,A,B): return X[1:] - X[:-1]@A.T - U@B.T
 
+floor_gap = np.linalg.eigvalsh(Sig - np.diag(sd**2)).min()
+print(f"[Sigma floor] min eig(Sigma - diag(sd^2)) = {floor_gap:.3e}"
+      f"  ({'OK' if floor_gap >= -1e-12 else 'VIOLATED'})")
+
 # ======================================================================
-# 4. Contraction metric P for THIS plant (App.-B SDP, eq. 32).
+# 5. Contraction metric P (unchanged)
 # ======================================================================
 print("Solving App.-B SDP for P...")
-THETA_mass, THETA_lc2 = 0.20, 0.12          # parametric uncertainty set (contains true mismatch)
+THETA_mass, THETA_lc2 = 0.20, 0.12
 thetas = [make_params(P_NOM["m1"]*f1, P_NOM["m2"]*f2, 0.5, 0.4, lc2f=0.55*f3)
           for f1 in (1-THETA_mass,1+THETA_mass)
           for f2 in (1-THETA_mass,1+THETA_mass)
           for f3 in (1-THETA_lc2,1+THETA_lc2)]
-# worst-case accel-space model error over Theta x (X x U) -> state box
 Ns=4000
 qs=np.c_[rng.uniform(-Q_MAX,Q_MAX,Ns),rng.uniform(-Q_MAX,Q_MAX,Ns)]
 qds=np.c_[rng.uniform(-QD_MAX,QD_MAX,Ns),rng.uniform(-QD_MAX,QD_MAX,Ns)]
@@ -240,10 +270,12 @@ for rho in np.linspace(0.8,0.97,12):
     if P is not None: break
 Psqrt = np.real(sqrtm(P)); PB = Psqrt@B0
 def pnorm(W): return np.sqrt(np.einsum('ki,ij,kj->k', W, P, W))
+def prad(center, halfw):
+    corners = np.array(list(itertools.product([-1,1],repeat=4)))*halfw + center
+    return pnorm(corners).max()
 
 # ======================================================================
-# 5. Analytical bound beta(x,a) of Proposition 1, recomputed for this plant.
-#    a=max||P^.5 B Mtil||, b=max||P^.5 B Ctil||, c=max||P^.5(B gtil)+P^.5 ddisc||
+# 6. Analytical bound beta (unchanged)
 # ======================================================================
 print("Recomputing analytical constants a,b,c...")
 qs2=np.c_[rng.uniform(-Q_MAX,Q_MAX,1200),rng.uniform(-Q_MAX,Q_MAX,1200)]
@@ -263,75 +295,161 @@ for th in thetas:
 print(f"   a={a:.4e} b={b:.4e} c={c:.4e}")
 
 # ======================================================================
-# 6. P-norm comparison along the trajectory + coverage on validation set
+# 7. THE TWO COMPARISONS
 # ======================================================================
-W_id   = residuals(X_id,   U_id,   A_hat, B_hat)          # effective-noise residuals (measured)
-W_idtr = Xtrue_id[1:]-Xtrue_id[:-1]@A_hat.T-U_id@B_hat.T   # noise-free
+W_id = residuals(X_id, U_id, A_hat, B_hat)
 qd_true = Xtrue_id[:-1, 2:]
-beta = a*np.linalg.norm(U_id,axis=1) + b*np.linalg.norm(qd_true,axis=1) + c   # Prop.1 along traj
+beta = a*np.linalg.norm(U_id,axis=1) + b*np.linalg.norm(qd_true,axis=1) + c
 wP   = pnorm(W_id)
 
-# data-driven set P-radius (max over its box corners), and analytical max radius
-corners = np.array(list(itertools.product([-1,1],repeat=4)))*hw_dd + c_dd
-rad_dd_P = pnorm(corners).max()
-ratio_max = beta.max()/rad_dd_P
-ratio_med = np.median(beta)/rad_dd_P
+# (I) discrepancy only:  omega_bar   vs   beta      [like for like]
+rad_omega = prad(np.zeros(n), omega_bar)
+ratio_I_max = beta.max()/rad_omega
+ratio_I_med = np.median(beta)/rad_omega
 
-# validation coverage of the data-driven set (should be ~ 1-delta)
+# (II) full effective uncertainty:  Z_wtilde   vs   beta
+rad_dd_P = prad(c_dd, hw_dd)
+rad_noise = prad(np.zeros(n), D_kappa)
+ratio_II_max = beta.max()/rad_dd_P
+ratio_II_med = np.median(beta)/rad_dd_P
+
 W_va = residuals(X_va, U_va, A_hat, B_hat)
 cov_dd = 100*np.all(np.abs(W_va - c_dd) <= hw_dd + 1e-12, axis=1).mean()
 cov_beta = 100*np.mean(pnorm(W_id) <= beta)
 
 lines = [
- "=== Theorem-1 set Z_wtilde  vs  analytical beta(x,a) [Prop.1], P-norm ===",
- f"omega_k model: discrepancy (no separate injection); meas-noise kept (ours)",
- f"SDP: active s_i = {int((s_star>1e-6).sum())}/{q}, sum(s*) = {s_star.sum():.3e}, eta = {eta:.3f}",
- f"P eigvals = {np.linalg.eigvalsh(P)}",
- f"Theta = +/-{int(THETA_mass*100)}% mass, +/-{int(THETA_lc2*100)}% lc2 (contains true mismatch)",
+ "=== Table 1 (region route): two comparisons in the same P-weighted norm ===",
+ f"eta_a = {eta_a:.4f}   isotropic noise assumption = {ISOTROPIC}   kappa = {KAPPA}",
+ f"Theta = +/-{int(THETA_mass*100)}% mass, +/-{int(THETA_lc2*100)}% lc2",
  f"analytical constants  a={a:.4e}  b={b:.4e}  c={c:.4e}",
  "",
- f"Z_wtilde half-widths [q1,q2,qd1,qd2] = {hw_dd}",
- f"  matrix-zonotope spread             = {mz_axis}",
- f"  bounded zonotope ||e_i^T G_omega||1 = {dz_axis}",
- f"  confidence eta*sqrt(Sigma_ii)      = {D_kappa}",
- f"  learned |lambda_k| mean/max        = {np.abs(lambdas.value).mean():.3f} / {np.abs(lambdas.value).max():.3f}",
+ "(I) DISCREPANCY ONLY -- like for like (both bound B*Delta_theta + Delta_disc)",
+ f"    omega_bar (calibrated)      = {omega_bar}",
+ f"    P-radius omega_bar          = {rad_omega:.4e}",
+ f"    P-radius beta_max           = {beta.max():.4e}",
+ f"    conservatism ratio          : max {ratio_I_max:.2f}x , median {ratio_I_med:.2f}x",
  "",
- f"beta(x,a) along traj : med={np.median(beta):.4e}  max={beta.max():.4e}",
+ "(II) FULL EFFECTIVE UNCERTAINTY -- Z_wtilde also covers measurement noise",
+ f"    h_wtilde = |g| + eta_a sqrt(Sigma_ii) = {hw_dd}",
+ f"      of which measurement noise          = {D_kappa}",
+ f"      eps_bar (Lemma 2 envelope)          = {eps_bar}",
+ f"    P-radius Z_wtilde           = {rad_dd_P:.4e}",
+ f"      of which noise alone      = {rad_noise:.4e}  "
+ f"({100*rad_noise/rad_dd_P:.0f}% of the set)",
+ f"    conservatism ratio          : max {ratio_II_max:.2f}x , median {ratio_II_med:.2f}x",
+ "",
+ f"beta(x,u) along traj : med={np.median(beta):.4e}  max={beta.max():.4e}",
  f"||w_tilde||_P        : med={np.median(wP):.4e}  max={wP.max():.4e}",
- f"coverage ||w||_P <= beta            : {cov_beta:.1f}%",
- f"data-driven set valid. coverage     : {cov_dd:.1f}%  (target {100*(1-delta_conf):.0f}%)",
+ f"coverage ||w||_P <= beta        : {cov_beta:.1f}%",
+ f"Z_wtilde validation coverage    : {cov_dd:.1f}%  (target {100*(1-DELTA_A):.0f}%)",
  "",
- f"P-radius  Z_wtilde = {rad_dd_P:.4e}",
- f"P-radius  beta_max = {beta.max():.4e}",
- f"conservatism ratio (beta/Z) : max {ratio_max:.2f}x , median {ratio_med:.2f}x",
+ "NOTE  beta omits measurement noise and uses exact states, so (II) is",
+ "      conservative in favour of the analytical bound; (I) is the comparison",
+ "      that isolates what the identification actually buys.",
 ]
 summary = "\n".join(lines); print(summary)
 with open(OUT_DIR/"summary.txt","w") as f: f.write(summary+"\n")
 
-
+# ======================================================================
+# 7b. VERIFICATION: does the prior bound omega_bar satisfy Assumption 3?
+#     In simulation the noise-free states are available, so the exact
+#     realization of B*Delta_theta + Delta_disc can be formed and checked
+#     against omega_bar.  This must report 100% for the finite-sample
+#     guarantee of Theorem 1 to apply to this dataset.
+# ======================================================================
+D_true  = Xtrue_id[1:] - Xtrue_id[:-1] @ A0.T - U_id @ B0.T
+dP_true = pnorm(D_true)
+print("\n[diagnostic] TRUE discrepancy d_k = x_{k+1} - A0 x_k - B0 u_k")
+print(f"             max |d_k| per coordinate = {np.abs(D_true).max(axis=0)}")
+print(f"             omega_bar                = {omega_bar}")
+print(f"             coverage |d_k| <= omega_bar (componentwise) : "
+      f"{100*np.all(np.abs(D_true) <= omega_bar + 1e-15, axis=1).mean():.1f}%")
+_cov_box = 100*np.all(np.abs(D_true) <= omega_bar + 1e-15, axis=1).mean()
+print(f"             coverage ||d_k||_P <= beta(x_k,u_k)         : "
+      f"{100*np.mean(dP_true <= beta):.1f}%")
+print("             -> Assumption 3 "
+      + ("SATISFIED on this dataset" if _cov_box == 100.0
+         else "VIOLATED: raise SAFETY or widen the calibration"))
+print(f"             ||d_k||_P : med={np.median(dP_true):.4e}  max={dP_true.max():.4e}")
 
 # ======================================================================
-# 7. Figure: per-step P-norm trace.
-#    ||w_tilde_k||_P  vs  beta(x_k,a_k), with the data-driven set P-radius as
-#    a horizontal line.  Both sides are P-radii, so there is no projection
-#    distortion: residuals < Z_wtilde radius < analytical bound at every step.
+# 7b. Comparison (III): like-for-like at equal coverage.
+#     beta covers the model discrepancy only; Z_wtilde must also cover the
+#     measurement-noise propagation.  Augmenting beta with the same noise
+#     envelope puts both on equal footing.  {x : ||x||_P <= beta} is a
+#     P-ball, so radii add exactly under the Minkowski sum.
 # ======================================================================
-plt.rcParams.update({"font.size":11,"axes.grid":True,"grid.alpha":0.3,
-                     "figure.dpi":160,"savefig.bbox":"tight"})
-C_DD, C_ANL, C_PTS = "#1f77b4", "#d62728", "0.55"
- 
-fig, axT = plt.subplots(figsize=(9.0, 4.2))
+beta_aug     = beta + rad_noise                 # per-step augmented radius
+rad_aug_max  = beta.max()      + rad_noise
+rad_aug_med  = np.median(beta) + rad_noise
+ratio_III_max = rad_aug_max / rad_dd_P
+ratio_III_med = rad_aug_med / rad_dd_P
+
+print("\n(III) LIKE-FOR-LIKE -- both descriptions cover discrepancy + noise")
+print(f"      noise envelope P-radius     = {rad_noise:.4e}")
+print(f"      beta (+) N : max {rad_aug_max:.4e}   med {rad_aug_med:.4e}")
+print(f"      Z_wtilde                    = {rad_dd_P:.4e}")
+print(f"      conservatism ratio          : max {ratio_III_max:.2f}x , "
+      f"median {ratio_III_med:.2f}x")
+
+# ======================================================================
+# 8. Figure: publication version (IEEE column width), both comparisons
+# ======================================================================
+TWO_COLUMN = False
+FIG_W = 7.16 if TWO_COLUMN else 3.5
+FIG_H = 3.20 if TWO_COLUMN else 2.65
+FS    = 9    if TWO_COLUMN else 8
+
+plt.rcParams.update({
+    "font.size": FS, "font.family": "serif",
+    "font.serif": ["Times New Roman", "Nimbus Roman", "DejaVu Serif"],
+    "mathtext.fontset": "stix",
+    "axes.grid": True, "grid.alpha": 0.25, "grid.linewidth": 0.4,
+    "axes.linewidth": 0.6,
+    "xtick.labelsize": FS - 1, "ytick.labelsize": FS - 1,
+    "xtick.major.width": 0.6, "ytick.major.width": 0.6,
+    "figure.dpi": 400, "savefig.bbox": "tight", "savefig.pad_inches": 0.02,
+})
+C_DD, C_ANL, C_AUG, C_OM, C_PTS = "#1f77b4", "#d62728", "#ff7f0e", "#2ca02c", "0.60"
+
+fig, axT = plt.subplots(figsize=(FIG_W, FIG_H))
 kk = np.arange(len(wP))
-axT.plot(kk, beta, color=C_ANL, lw=1.4, ls="--",
-         label=r"analytical bound $\beta(x_k,u_k)$")
-axT.plot(kk, wP, color=C_PTS, lw=0.9, alpha=0.9,
-         label=r"residual $\Vert\tilde w_k\Vert_P$")
-axT.axhline(rad_dd_P, color=C_DD, lw=1.8,
-            label=r"$\mathcal{Z}_{\tilde w}$ $P$-radius")
+
+axT.plot(kk, wP, color="0.60", lw=0.5, alpha=0.85, zorder=1,
+         label=r"$\Vert\tilde w_k\Vert_P$")
+# comparison (I): discrepancy only
+axT.axhline(rad_omega, color=C_OM, lw=2.0, ls=":", zorder=5,
+            label=r"$\bar\omega$ radius")
+axT.plot(kk, beta, color=C_ANL, lw=1.3, ls="--", zorder=4,
+         label=r"$\beta(x_k,u_k)$")
+# comparison (III): discrepancy + noise
+axT.axhline(rad_dd_P, color=C_DD, lw=1.8, zorder=4,
+            label=r"$\mathcal{Z}_{\tilde w}$ radius")
+axT.plot(kk, beta_aug, color=C_AUG, lw=1.5, ls="-.", zorder=5,
+         label=r"$\beta\oplus\mathcal{N}$")
+
+def _gap(x_frac, lo, hi, txt):
+    x = int(x_frac * len(kk))
+    axT.annotate("", xy=(x, hi), xytext=(x, lo),
+                 arrowprops=dict(arrowstyle="<->", color="0.25", lw=0.8,
+                                 shrinkA=0, shrinkB=0), zorder=6)
+    axT.text(x - 0.015*len(kk), np.sqrt(lo*hi), txt, fontsize=FS-1.5,
+             color="0.25", ha="right", va="center", zorder=6,
+             bbox=dict(boxstyle="round,pad=0.12", fc="white", ec="none", alpha=0.8))
+
+_gap(0.60, rad_omega, np.median(beta), rf"${ratio_I_med:.1f}\times$")
+_gap(0.90, rad_dd_P, rad_aug_med,      rf"${ratio_III_med:.2f}\times$")
+
 axT.set_yscale("log")
-axT.set_ylabel(r"$P$-weighted magnitude")
-axT.set_xlabel(r"time step $k$")
-axT.legend(loc="center right", frameon=False, fontsize=9)
+axT.set_ylabel(r"$P$-weighted magnitude", labelpad=2)
+axT.set_xlabel(r"time step $k$", labelpad=2)
+axT.set_ylim(wP.min()*0.22, rad_aug_max*3.0)
 axT.margins(x=0.01)
-fig.savefig(OUT_DIR/"fig1_residual_sets.png")
+axT.legend(loc="lower left", bbox_to_anchor=(0.0, 0.0), ncol=3,
+           frameon=False, fontsize=FS-1.5, handlelength=1.4,
+           handletextpad=0.35, columnspacing=0.9, borderaxespad=0.3,
+           labelspacing=0.25)
+
+for ext in ("pdf", "png"):
+    fig.savefig(OUT_DIR / f"fig1_residual_sets.{ext}")
 print(f"\nFigure and summary written to: {OUT_DIR}")

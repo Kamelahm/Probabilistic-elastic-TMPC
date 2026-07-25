@@ -1,55 +1,71 @@
 import numpy as np
 import pickle
+
 from aux import (TimeStepIntegratorContinuous,
                  get_linear_double_integrator_discrete_dynamics)
 from problem_scenario import ProblemScenarioMassAllPin
 from examples.planar_two_dof import P_EXAMPLE_2_DOF
 
-# -- Load scenario --------------------------------------------------------
+# ---------------------------------------------------------------- scenario --
 p_d = P_EXAMPLE_2_DOF / "data" / "dof_2_ef_0.1"
-ps  = ProblemScenarioMassAllPin.from_cached_dir(p_d)
+ps = ProblemScenarioMassAllPin.from_cached_dir(p_d)
 
 A, B = get_linear_double_integrator_discrete_dynamics(
     ps.config_dim, dt=ps.dt, method="zoh")
-n = A.shape[0]
-m = B.shape[1]
+n, m = A.shape[0], B.shape[1]
+nq = ps.config_dim
 
 integrator = TimeStepIntegratorContinuous(dt=ps.dt)
 integrator.set_dyns(ps.get_nominal_dynamics(), ps.get_err_dyn_random())
 
-V_hat = (1e-5) ** 2 * np.eye(n)
+SIGMA = 1e-5                      # measurement-noise STD
+V_hat = SIGMA ** 2 * np.eye(n)    # COVARIANCE = 1e-10 * I  (paper says 1e-5:
 
-# -- Improved data collection --------------------------------------------
-T = 2000                      # 8x more samples
-RESET_EVERY = 50              # reset state to keep it in the linear regime
+# ------------------------------------------------------------- excitation ---
+T = 2000
 np.random.seed(42)
+rng = np.random.default_rng(42)
 
-# Balanced multisine excitation: same amplitude / spectrum on BOTH joints,
-# independent random phases so the channels are uncorrelated.
-t = np.arange(T) * ps.dt
-freqs = np.array([0.5, 1.1, 2.0, 3.3, 5.0])   # rich frequency content (Hz)
-amp = 0.5                                       # per-channel amplitude
+# Low-frequency multisine POSITION reference.
+FREQS = np.array([0.08, 0.17, 0.31, 0.53, 0.89])      # Hz
+AMPS = 0.90 * np.array([0.55, 0.40, 0.28, 0.16, 0.09])  # rad, per component
+KP, KD = 80.0, 18.0               # PD gains on the feedback-linearised plant
+DITHER = 1.5                      # rad/s^2, independent input dither
+U_MAX = 20.0                      # matches the MPC input constraint
+
+t = np.arange(T + 1) * ps.dt
+w = 2.0 * np.pi * FREQS
+phase = rng.uniform(0.0, 2.0 * np.pi, (nq, FREQS.size))
+
+q_ref = np.stack([(AMPS * np.sin(np.outer(t, w) + phase[i])).sum(1)
+                  for i in range(nq)], axis=1)
+qd_ref = np.stack([(AMPS * w * np.cos(np.outer(t, w) + phase[i])).sum(1)
+                   for i in range(nq)], axis=1)
+qdd_ref = np.stack([(-AMPS * w ** 2 * np.sin(np.outer(t, w) + phase[i])).sum(1)
+                    for i in range(nq)], axis=1)
+
+# ------------------------------------------------------------- simulate -----
+X = np.zeros((n, T + 1))                     # TRUE states, noise-free
 U0 = np.zeros((m, T))
-for i in range(m):
-    sig = np.zeros(T)
-    for f in freqs:
-        phase = np.random.uniform(0, 2 * np.pi)
-        sig += np.sin(2 * np.pi * f * t + phase)
-    U0[i] = amp * sig / np.sqrt(len(freqs))     # normalize power
+X[:, 0] = np.concatenate([q_ref[0], qd_ref[0]])
 
-Y0 = np.zeros((n, T))
-Y1 = np.zeros((n, T))
-
-x = np.zeros(n)
 for k in range(T):
-    if k % RESET_EVERY == 0:
-        x = np.zeros(n)        # reset: keep state near the linearization point
-    Y0[:, k] = x + np.random.multivariate_normal(np.zeros(n), V_hat)
-    x_next   = integrator.solve_time_step(x, U0[:, k])
-    Y1[:, k] = x_next + np.random.multivariate_normal(np.zeros(n), V_hat)
-    x = x_next
+    x = X[:, k]
+    u = (qdd_ref[k]
+         + KP * (q_ref[k] - x[:nq])
+         + KD * (qd_ref[k] - x[nq:])
+         + rng.uniform(-DITHER, DITHER, m))
+    u = np.clip(u, -U_MAX, U_MAX)
+    U0[:, k] = u
+    X[:, k + 1] = integrator.solve_time_step(x, u)
 
-# -- Save -----------------------------------------------------------------
+# ONE i.i.d. measurement-noise sequence {upsilon_k}_{k=0}^{T}, shared between
+# Y0[:, k] = x_k + ups_k   and   Y1[:, k] = x_{k+1} + ups_{k+1}.
+ups = rng.normal(0.0, SIGMA, size=(n, T + 1))
+Y0 = X[:, :T] + ups[:, :T]
+Y1 = X[:, 1:] + ups[:, 1:]
+
+# ------------------------------------------------------------------ save ----
 data = {
     "U0": U0, "Y0": Y0, "Y1": Y1,
     "V_hat": V_hat,
@@ -57,19 +73,47 @@ data = {
     "n": n, "m": m, "dt": ps.dt,
     "config_dim": ps.config_dim,
 }
-out_path = p_d / "id_dataset.pckl"
-with open(out_path, "wb") as f:
+with open(p_d / "id_dataset.pckl", "wb") as f:
     pickle.dump(data, f)
-print(f"Dataset saved to {out_path}")
-print(f"  T = {T} samples, reset every {RESET_EVERY} steps")
-print(f"  U0 shape: {U0.shape}, Y0 shape: {Y0.shape}, Y1 shape: {Y1.shape}")
+print(f"Dataset saved to {p_d / 'id_dataset.pckl'}   (T = {T})")
 
-# -- State range check (should stay small / linear) -----------------------
-print(f"\n  max |position| reached: {np.abs(Y0[:ps.config_dim]).max():.4f}")
-print(f"  max |velocity| reached: {np.abs(Y0[ps.config_dim:]).max():.4f}")
+# ------------------------------------------------------------ diagnostics ---
+Z0 = np.vstack([Y0, U0])
+sv = np.linalg.svd(Z0, compute_uv=False)
 
-# -- Effective disturbance ------------------------------------------------
+print("\n--- excitation ---")
+print(f"  std(q)   per joint : {Y0[:nq].std(axis=1)}")
+print(f"  std(qdot)per joint : {Y0[nq:].std(axis=1)}")
+print(f"  max|q|             : {np.abs(X[:nq]).max():.4f} rad   "
+      f"(old design: 0.043)")
+print(f"  max|qdot|          : {np.abs(X[nq:]).max():.4f} rad/s (limit 2.0)")
+print(f"  max|u|             : {np.abs(U0).max():.4f}     (limit {U_MAX})")
+print(f"  rank(Z0)           : {np.linalg.matrix_rank(Z0, tol=1e-8)} / {n + m}")
+print(f"  cond(Z0)           : {sv[0] / sv[-1]:.1f}          (old design: 116)")
+
 W_tilde = Y1 - A @ Y0 - B @ U0
-print("\n--- Effective disturbance w_tilde_k ---")
-print(f"  Max |.| per dim: {np.abs(W_tilde).max(axis=1)}")
-print(f"  Std  per dim:    {W_tilde.std(axis=1)}")
+print("\n--- effective uncertainty w_tilde (vs the IDEAL ZOH model) ---")
+print(f"  max |.| per dim : {np.abs(W_tilde).max(axis=1)}")
+print(f"  std  per dim    : {W_tilde.std(axis=1)}")
+print(f"  pure-noise std would be ~sqrt(1+||A||^2)*sigma = "
+      f"{np.sqrt(1 + np.linalg.norm(A, 2) ** 2) * SIGMA:.3e}")
+
+# ------------------------------------------- structural check (ZOH ratio) ---
+Z_true = np.vstack([X[:, :T], U0])
+Theta_ls = X[:, 1:] @ np.linalg.pinv(Z_true)        # best linear one-step map
+dTheta = Theta_ls - np.hstack([A, B])
+dA_pos, dA_vel = np.abs(dTheta[:nq, :n]).max(), np.abs(dTheta[nq:, :n]).max()
+dB_pos, dB_vel = np.abs(dTheta[:nq, n:]).max(), np.abs(dTheta[nq:, n:]).max()
+ratio_A = dA_pos / max(dA_vel, 1e-300)
+ratio_B = dB_pos / max(dB_vel, 1e-300)
+
+print("\n--- structural check: position vs velocity rows of the one-step map ---")
+print(f"  |dA| position rows : {dA_pos:.3e}      |dB| position rows : {dB_pos:.3e}")
+print(f"  |dA| velocity rows : {dA_vel:.3e}      |dB| velocity rows : {dB_vel:.3e}")
+print(f"  ratio pos/vel  (A) : {ratio_A:.4f}     (B) : {ratio_B:.4f}")
+print(f"  structural prediction Ts/2 = {ps.dt / 2:.4f}")
+need = max(ratio_A, ratio_B) / (ps.dt / 2)
+print(f"  => struct_safety >= {need:.1f} is supported by this data")
+if need > 5.0:
+    print("     *** ratio well above Ts/2: higher-order terms are significant,")
+    print("     *** so the structured hull will buy less than projected. ***")

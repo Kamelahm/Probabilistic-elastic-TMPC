@@ -147,6 +147,8 @@ def run_experiments_from_dir(p_d, nr_runs=10,  seed=0, goal_tol = 0.01, save_res
         path_centers = interpolate_equidistant(path_centers, delta=0.001)
         path_radii = world.sdf(path_centers)
         world.dist_margin = 0
+
+
         logger.debug(f"---run {run_nr}")
         if save_results:
             p_r = p_d / "corridors"
