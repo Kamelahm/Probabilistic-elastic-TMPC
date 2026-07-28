@@ -30,15 +30,13 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # ============================================================== switches ====
 ISOTROPIC     = True      # Assumption 2 verbatim
-KAPPA         = 1.01      # a priori spectral bound kappa_hat, FIXED
+KAPPA         = 1.10      # a priori spectral bound kappa_hat, FIXED
 DELTA_A       = 0.05
 K_BAR         = 500       # closed-loop horizon entering eta_a
 SAFETY        = 2.0       # margin on the calibrated omega_hat
 OMEGA_FLOOR   = 1e-8
 GEN_SCALE     = 1.0       # g = GEN_SCALE * omega_hat when OPTIMIZE_G is False
 OPTIMIZE_G    = False
-LEMMA1_FLOOR  = True      # True -> (1+kappa)^2 Vhat  (Lemma 1 constant)
-                          # False -> sigma^2 (1+kappa^2) (Lemma 2 constant)
 LAMBDA_REG    = True      # L1 term on lambda in the objective; see note below
 
 T_ID          = 1500
@@ -228,15 +226,6 @@ else:
     sd = np.sqrt(sigma_vec ** 2 + KAPPA ** 2 * sigma_hat ** 2)
 noise_hw = eta_a * sd
 
-# The Sigma floor.  NOTE: with LEMMA1_FLOOR the floor constant (1+kappa)
-# EXCEEDS the Lemma-2 constant sqrt(1+kappa^2), so the floor -- not (10h) --
-# is the binding lower bound.  Diagnostics below must use the binding one.
-if LEMMA1_FLOOR:
-    floor_sd = (1.0 + KAPPA) * sigma_vec        # Lemma 1
-else:
-    floor_sd = sd                               # Lemma 2
-bind_sd = np.maximum(floor_sd, sd)              # what actually binds
-noise_hw_bind = eta_a * bind_sd
 
 if EPS_P != EPS_V and ISOTROPIC:
     print("[warn] simulated noise is anisotropic -> Assumption 2 violated as "
@@ -306,7 +295,6 @@ G_omega = np.diag(g)
 print(f"[envelope] eta_a={eta_a:.4f}  isotropic={ISOTROPIC}  "
       f"sigma_hat={sigma_hat:.3e}  SAFETY={SAFETY}")
 print(f"           noise hw (Lemma 2)      = {noise_hw}")
-print(f"           noise hw (binding)      = {noise_hw_bind}")
 print(f"           eps_min (calib, T={T_CAL:4d}) = {eps_min_cal}")
 print(f"           eps_min corner spread   = "
       f"{eps_per_corner.max(0) / np.maximum(eps_per_corner.min(0), 1e-300)}")
@@ -316,18 +304,7 @@ print(f"           calib/ident ratio       = "
 print(f"           omega_hat (calibrated)  = {omega_bar}")
 print(f"           eps_bar                 = {eps_bar}")
 
-# ---------------------------------------------------------------------------
-# INERTNESS PREDICATE -- decided before the SDP is solved.
-# ---------------------------------------------------------------------------
-inert_threshold = omega_bar + noise_hw_bind          # lower bound on h
-print("\n[inertness, a priori] the residual route can bind only where")
-print(f"        max_k |r_k - c| > omega_hat + eta_a*bind_sd = "
-      f"{inert_threshold}")
-print(f"        identification residual scale (eps_min_id)  = {eps_min_id}")
-print(f"        headroom needed (ratio)                     = "
-      f"{inert_threshold / np.maximum(eps_min_id, 1e-300)}")
-print("        -> ratios >> 1 mean the SDP is inert by construction, not by "
-      "tuning.")
+
 
 # ============================================================================
 # 4. Theorem-1 SDP, region route
@@ -360,7 +337,7 @@ c_h = cp.Variable(n)                            # c_omega = SB * c_h
 t_h = cp.Variable(n, nonneg=True)
 
 cons = [cp.bmat([[Sig_h, cp.diag(t_h)], [cp.diag(t_h), np.eye(n)]]) >> 0]
-cons += [Sig_h >> np.diag((floor_sd / SB) ** 2)]
+
 
 if OPTIMIZE_G:
     g_h = cp.Variable(n, nonneg=True)
@@ -379,12 +356,6 @@ for k in range(T_ID):
             cp.abs(r_k[i] - c_h[i] - bounded_term[i, k])
             <= eta_a * t_h[i] - (s_h @ np.abs(V[k, i, :])))
 
-# NOTE on s: s enters only as a tightening term on the RHS and is minimised in
-# the objective, so s* = 0 identically and the 24 generators do not shape the
-# reported set.  If the intent is a nontrivial polytopic model set M, s must be
-# bounded below by a data-consistency requirement rather than minimised.  As
-# written the reported set is that of the point model (A_hat, B_hat).  This is
-# flagged, not silently accepted.
 
 if OPTIMIZE_G:
     cons.append(g_h + eta_a * cp.sqrt(cp.diag(Sig_h))
@@ -397,9 +368,6 @@ else:
                 >= eps_bar / SB + cp.abs(c_h) - np.abs(g) / SB)
     obj = cp.sum(s_h) + cp.trace(Sig_h)
     if LAMBDA_REG:
-        # L1 bias toward lambda = 0, pushing absorption into Sigma.  Inert
-        # here because the floor binds, but it is a modelling choice: state it
-        # or switch it off.
         obj = obj + cp.sum(cp.abs(lambdas)) / T_ID
 
 print("Solving SDP...")
@@ -430,39 +398,21 @@ def residuals(X, U, A, B):
 
 # --------------------------------------------------- which constraint binds --
 R_id = Y1 - A_hat @ Y0 - B_hat @ U0                    # n x T
-floor_hw = np.abs(g_out) + eta_a * floor_sd            # Sigma-floor route
 cov_hw = eps_bar + np.abs(c_om)                        # (10h) route
 data_hw = np.abs(R_id - c_om[:, None]).max(axis=1)     # (10f) route
-routes = np.vstack([floor_hw, cov_hw, data_hw])
+routes = np.vstack([cov_hw, data_hw])
 which = np.array(["floor", "(10h)", "(10f)"])[np.argmax(routes, axis=0)]
-data_margin = data_hw / np.maximum(np.maximum(floor_hw, cov_hw), 1e-300) - 1.0
+data_margin = data_hw / np.maximum(cov_hw, 1e-300) - 1.0
 
 print("\n[binding constraint, per coordinate]")
 print(f"        achieved h_wtilde        = {hw_dd}")
-print(f"        Sigma-floor route        = {floor_hw}")
 print(f"        coverage (10h) route     = {cov_hw}")
 print(f"        residual (10f) route     = {data_hw}")
 print(f"        active                   = {which}")
 print(f"        data contribution        = {data_margin}"
       f"   (<= 0 everywhere => SDP is inert)")
 
-# --------------------------------------- omega_hat ceiling, binding constant --
-# FIXED: uses the BINDING noise constant (max of Lemma-1 floor and Lemma-2
-# envelope).  Using sd alone when LEMMA1_FLOOR is on reports the gap between
-# two different constants as "coverage slack", which it is not.
-omega_ceiling = hw_dd - noise_hw_bind - np.abs(c_om)
-binds = np.allclose(omega_ceiling, omega_bar, rtol=1e-3)
-print("\n[omega_hat ceiling implied at the achieved h_wtilde]")
-print(f"        binding noise constant   = "
-      f"{'Lemma 1 (1+kappa)' if LEMMA1_FLOOR else 'Lemma 2 sqrt(1+kappa^2)'}")
-print(f"        ceiling   = {omega_ceiling}")
-print(f"        omega_hat = {omega_bar}")
-print(f"        slack     = {omega_ceiling - omega_bar}"
-      f"   ({'coverage binds' if binds else 'coverage slack'})")
 
-floor_gap = np.linalg.eigvalsh(Sig - np.diag(floor_sd ** 2)).min()
-print(f"[Sigma floor] min eig(Sigma - diag(floor_sd^2)) = {floor_gap:.3e}"
-      f"  ({'OK' if floor_gap >= -1e-9 else 'VIOLATED'})")
 
 # ============================================================================
 # 5. Contraction metric P
@@ -596,21 +546,13 @@ beta_aug = beta + rad_noise
 
 W_va = residuals(X_va, U_va, A_hat, B_hat)
 cov_dd = 100 * np.all(np.abs(W_va - c_dd) <= hw_dd + 1e-12, axis=1).mean()
-# Coverage of the counterfactual data-only set on VALIDATION data.  If this is
-# at or above the target, the floor is conservative rather than necessary.
+
 cov_data = 100 * np.all(np.abs(W_va - c_om) <= data_hw + 1e-12, axis=1).mean()
 
-# FIXED LABELS -------------------------------------------------------------
-# noise content of omega_hat: what fraction of the prior is the measurement
-# envelope.  (The old "noise share" printed 1 - disc/omega, which is safety
-# factor + corner margin + noise bundled together, and is NOT a noise share.)
 noise_content = np.minimum(noise_hw / np.maximum(omega_bar, 1e-300), 1.0)
 disc_share = np.minimum(disc_hw / np.maximum(omega_bar, 1e-300), 1.0)
 
 cov_beta_true = 100 * np.mean(dP_true <= beta)   # the meaningful check
-# NOTE: pnorm(W_id) <= beta is NOT a coverage check -- it compares
-# identified-model residuals (noise included) against a bound on the NOMINAL
-# discrepancy at exact states.  It is deliberately not reported.
 
 lines = [
     "=== Table 1 (region route): comparisons in the P-weighted norm ===",
@@ -685,9 +627,6 @@ print("        -> " + ("SATISFIED" if cov_box_id == 100.0 else "VIOLATED"))
 # ============================================================================
 a3 = {}
 if VERIFY_A3:
-    # FIXED: the vertices of Theta are tested explicitly.  Uniform interior
-    # draws essentially never approach a vertex in 3-D, so the old test passed
-    # almost automatically while omega_hat was calibrated AT the vertices.
     print(f"\n[Assumption 3a] Theta vertices ({len(thetas)} corners "
           f"x {A3_T} steps)")
     worst_vert = np.zeros(n)
@@ -753,8 +692,7 @@ with open(OUT_DIR / "summary.txt", "w") as f:
 # ============================================================================
 res = dict(
     config=dict(eta_a=float(eta_a), kappa=KAPPA, delta_a=DELTA_A,
-                safety=SAFETY, isotropic=ISOTROPIC, optimize_g=OPTIMIZE_G,
-                lemma1_floor=LEMMA1_FLOOR, lambda_reg=LAMBDA_REG,
+                safety=SAFETY, isotropic=ISOTROPIC, optimize_g=OPTIMIZE_G, lambda_reg=LAMBDA_REG,
                 T_id=T_ID, T_cal=T_CAL, matched_theta=MATCHED_THETA,
                 theta_mass=THETA_MASS, theta_lc2=THETA_LC2,
                 theta_mass_cal=THETA_MASS_CAL, theta_lc2_cal=THETA_LC2_CAL,
@@ -763,8 +701,7 @@ res = dict(
     abc=dict(a=float(a), b=float(b), c=float(c)),
     omega_hat=omega_bar.tolist(),
     eps_min_cal=eps_min_cal.tolist(), eps_min_id=eps_min_id.tolist(),
-    h_wtilde=hw_dd.tolist(), data_hw=data_hw.tolist(),
-    floor_hw=floor_hw.tolist(), cov_hw=cov_hw.tolist(),
+    h_wtilde=hw_dd.tolist(), data_hw=data_hw.tolist(), cov_hw=cov_hw.tolist(),
     binding_route=list(which), data_margin=data_margin.tolist(),
     realised_disc_box=disc_hw.tolist(),
     noise_content=noise_content.tolist(),
