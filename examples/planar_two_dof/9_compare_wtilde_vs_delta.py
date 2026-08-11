@@ -1,7 +1,7 @@
 """
 Table 1 / Figure 1 -- conservatism of the identified uncertainty set.
 Region route of Theorem 1, planar 2-DOF manipulator.
------------------------------------------------------------------------------
+
 """
 import os
 import json
@@ -37,7 +37,17 @@ SAFETY        = 2.0       # margin on the calibrated omega_hat
 OMEGA_FLOOR   = 1e-8
 GEN_SCALE     = 1.0       # g = GEN_SCALE * omega_hat when OPTIMIZE_G is False
 OPTIMIZE_G    = False
-LAMBDA_REG    = True      # L1 term on lambda in the objective; see note below
+LAMBDA_REG    = True      # L1 term on lambda in the objective
+LAMBDA_SIGMA  = 1.0       # lambda_sigma of (11a): stochastic vs deterministic
+
+# --- M1: ablation.  "prior_only" skips (11) entirely and uses the Lemma-2
+#     envelope directly.  If the closed-loop numbers are unchanged, the
+#     identification contributes nothing and Contribution 1 must be restated.
+ABLATION      = os.environ.get("THM1_ABLATION", "sdp")   # "sdp" | "prior_only"
+assert ABLATION in ("sdp", "prior_only")
+
+# --- M1: enforce Lemma 1 (per-sample covariance bound) inside (11).
+ENFORCE_LEMMA1 = True
 
 T_ID          = 1500
 T_VAL         = 800
@@ -47,7 +57,7 @@ T_CAL         = 400
 THETA_MASS    = 0.20
 THETA_LC2     = 0.12
 
-# Calibrate the prior over the same Theta that beta covers.  See header.
+# Calibrate the prior over the same Theta that beta covers.
 MATCHED_THETA = True
 THETA_MASS_CAL = THETA_MASS if MATCHED_THETA else 0.10
 THETA_LC2_CAL  = THETA_LC2  if MATCHED_THETA else 0.06
@@ -57,8 +67,181 @@ CAL_SEED      = 2718      # fixed ACROSS corners: eps_min becomes a clean
                           # realisation drawn at each corner
 VERIFY_A3     = True
 A3_T          = 400
-A3_INTERIOR   = 8         # interior draws, in addition to the vertices
-A3_AMP_OOD    = 0.9       # out-of-distribution trajectory amplitude
+A3_INTERIOR   = 8
+A3_AMP_OOD    = 0.9
+
+# --- diagnostics
+RUN_SUPPORT_GAP = True    # interval hull of F vs exact support (T3)
+SUPPORT_SAMPLES = 8
+
+# ============================================================================
+# 0. M1 diagnostics
+# ============================================================================
+def audit_theorem1(g, hw, c_om, eps_bar, R_id, eta_a, s_star=None,
+                   sigma_bar_hw=None, rtol=2e-2, verbose=True):
+    """Does (11) contribute anything to the SIZE of the description?
+
+    Compares the two routes to the achieved half-widths h_wtilde:
+        coverage (11f) : eps_bar + |c_omegabar|
+        residual (11d) : max_k |r_k - c_omegabar|
+    If (11f) binds everywhere the identified region IS the Lemma-2 envelope.
+    """
+    g, hw, c_om, eps_bar = map(np.asarray, (g, hw, c_om, eps_bar))
+    n = len(hw)
+    coverage_route = eps_bar + np.abs(c_om)                     # (11f)
+    residual_route = np.abs(R_id - c_om[:, None]).max(axis=1)   # (11d)
+    binds = ["coverage(11f)" if coverage_route[i] >= residual_route[i]
+             else "residual(11d)" for i in range(n)]
+    headroom = coverage_route / np.maximum(residual_route, 1e-300)
+    equals_prior = bool(np.allclose(hw, coverage_route, rtol=rtol))
+    inert = all(b == "coverage(11f)" for b in binds)
+
+    out = dict(h_wtilde=hw.tolist(),
+               coverage_route=coverage_route.tolist(),
+               residual_route=residual_route.tolist(),
+               binding=binds,
+               headroom=headroom.tolist(),
+               headroom_min=float(headroom.min()),
+               headroom_max=float(headroom.max()),
+               identified_equals_prior=equals_prior,
+               centre_at_origin=bool(np.allclose(
+                   c_om, 0.0, atol=rtol * np.abs(eps_bar).max())),
+               sdp_inert=inert,
+               s_star_sum=None if s_star is None else float(np.sum(s_star)),
+               s_star_active=None if s_star is None
+               else int((np.abs(s_star) > 1e-9).sum()))
+
+    if verbose:
+        print("\n" + "=" * 74)
+        print("M1 AUDIT -- what does Theorem 1 contribute?")
+        print("=" * 74)
+        w = 14
+        print(f"  {'coord':>5} {'h_wtilde':>{w}} {'coverage(11f)':>{w}} "
+              f"{'residual(11d)':>{w}} {'binds':>15}")
+        for i in range(n):
+            print(f"  {i:>5} {hw[i]:{w}.4e} {coverage_route[i]:{w}.4e} "
+                  f"{residual_route[i]:{w}.4e} {binds[i]:>15}")
+        print(f"\n  centre c*_omegabar          = "
+              f"{np.array2string(c_om, precision=3)}")
+        if s_star is not None:
+            print(f"  sum(s*) / active generators = {np.sum(s_star):.3e} / "
+                  f"{int((np.abs(s_star) > 1e-9).sum())}")
+        if sigma_bar_hw is not None:
+            print(f"  Lemma-1 floor eta_a*sqrt(Sigma_bar_ii) = "
+                  f"{np.array2string(np.atleast_1d(sigma_bar_hw), precision=5)}")
+        print(f"  coverage/residual headroom  = "
+              f"{headroom.min():.2f}x to {headroom.max():.2f}x")
+        print(f"  identified region == prior? = "
+              f"{'YES' if equals_prior else 'no'}")
+        print("\n  VERDICT: ", end="")
+        if inert:
+            print("(11f) binds in EVERY coordinate.")
+            print("           The identified region is the Lemma-2 envelope;")
+            print("           (11) does not tighten it.  Contribution 1 must")
+            print("           be stated as certified packaging, not as a")
+            print("           reduction in conservatism.")
+        else:
+            tight = [i for i in range(n) if binds[i] == "residual(11d)"]
+            print(f"(11d) binds in coordinates {tight}.")
+            print("           The data does constrain the description there.")
+        print("=" * 74)
+    return out
+
+
+def _row_ub(Z, y_row, eps_i):
+    """Constraints of F restricted to one output row (see (13))."""
+    return (np.vstack([Z.T, -Z.T]),
+            np.concatenate([y_row + eps_i, -y_row + eps_i]))
+
+
+def feasible_hull(Y1r, Z, eps):
+    """(14): componentwise extrema of F.  Returns Theta_bar, Gamma."""
+    n_, d = Y1r.shape[0], Z.shape[0]
+    Tb, Gm = np.empty((n_, d)), np.empty((n_, d))
+    for i in range(n_):
+        A_ub, b_ub = _row_ub(Z, Y1r[i], eps[i])
+        lo, hi = np.empty(d), np.empty(d)
+        for b in range(d):
+            cvec = np.zeros(d)
+            cvec[b] = 1.0
+            r1 = linprog(cvec, A_ub=A_ub, b_ub=b_ub,
+                         bounds=[(None, None)] * d, method="highs")
+            r2 = linprog(-cvec, A_ub=A_ub, b_ub=b_ub,
+                         bounds=[(None, None)] * d, method="highs")
+            if not (r1.success and r2.success):
+                raise RuntimeError("hull LP failed; check Assumption 4 "
+                                   "(full row rank Z_0)")
+            lo[b], hi[b] = r1.fun, -r2.fun
+        Tb[i], Gm[i] = 0.5 * (lo + hi), 0.5 * (hi - lo)
+    return Tb, Gm
+
+
+def support_gap(Y1r, Z, eps, Theta_bar, Gamma, n_samples=8, seed=0,
+                verbose=True):
+    """Box-hull bound (Lemma 3) vs exact support over F.
+
+    Lemma 3 bounds |e_a^T [dA dB] psi| by sum_b Gamma_ab |psi_b|, the support
+    of the BOX HULL of F.  F is a thin correlated slab, so the exact support
+    is smaller.  The ratio is conservatism injected by the relaxation in (14),
+    not by the uncertainty itself.
+    """
+    r_ = np.random.default_rng(seed)
+    n_, T_ = Y1r.shape
+    d = Z.shape[0]
+    ratios = []
+    for _ in range(n_samples):
+        k = int(r_.integers(0, T_))
+        psi = Z[:, k]
+        for i in range(n_):
+            box = Gamma[i] @ np.abs(psi)
+            A_ub, b_ub = _row_ub(Z, Y1r[i], eps[i])
+            ex = 0.0
+            for sgn in (1.0, -1.0):
+                r = linprog(-sgn * psi, A_ub=A_ub, b_ub=b_ub,
+                            bounds=[(None, None)] * d, method="highs")
+                if r.success:
+                    ex = max(ex, -r.fun - sgn * (psi @ Theta_bar[i]))
+            ratios.append(box / max(ex, 1e-300))
+    ratios = np.array(ratios)
+    out = dict(median=float(np.median(ratios)), min=float(ratios.min()),
+               max=float(ratios.max()), n=int(len(ratios)))
+    if verbose:
+        print("\n[interval-hull conservatism]  Lemma 3 vs exact support over F")
+        print(f"        box/exact over {out['n']} samples: "
+              f"median {out['median']:.2f}x  "
+              f"range {out['min']:.2f}-{out['max']:.2f}x")
+        print("        -> this much tube inflation comes from the box")
+        print("           relaxation in (14), removable without any new")
+        print("           assumption or probability budget.")
+    return out
+
+
+def chebyshev_eps(Xn, Un):
+    """min_Theta max_k |y_{k+1,a} - Theta z_k| per coordinate (one LP/row).
+
+    Doubles as the Chebyshev floor: no data-consistent envelope can be
+    smaller than this, so eps_bar / floor is the honest statement of how
+    much slack the prior carries.
+    """
+    Ya0, Ya1, Ua0 = Xn[:-1].T, Xn[1:].T, Un.T
+    Tn = Ya0.shape[1]
+    Zc = np.vstack([Ya0, Ua0])
+    dd = Zc.shape[0]
+    A_ub = np.block([[Zc.T, -np.ones((Tn, 1))],
+                     [-Zc.T, -np.ones((Tn, 1))]])
+    c_lp = np.zeros(dd + 1)
+    c_lp[-1] = 1.0
+    out = []
+    for a in range(Ya1.shape[0]):
+        res_ = linprog(c_lp, A_ub=A_ub,
+                       b_ub=np.concatenate([Ya1[a, :], -Ya1[a, :]]),
+                       bounds=[(None, None)] * dd + [(0.0, None)],
+                       method="highs")
+        if not res_.success:
+            raise RuntimeError(f"Chebyshev LP failed on row {a}: {res_.message}")
+        out.append(res_.x[-1])
+    return np.array(out)
+
 
 # ============================================================================
 # 1. Manipulator model
@@ -169,7 +352,16 @@ def rk4_step(x, u, dt, nsub=10, pt=None):
 # 2. Data collection
 # ============================================================================
 TS = 0.01
-EPS_P, EPS_V = 2e-4, 2e-4
+
+# --- M1 item 9: simulated noise vs a priori bound, kept explicitly distinct.
+SIGMA_TRUE = 2.0e-4       # what collect() actually injects
+SIGMA_HAT  = 2.0e-4       # Assumption 3 prior used by identification/tube
+# Set SIGMA_TRUE = 1.0e-5 to match the covariance stated in Sec. V-C.  Doing
+# so changes the reported numbers; the legacy value is kept as the default so
+# the existing Table 1 reproduces.  Whichever is chosen, the manuscript and
+# the script must agree -- see the warning printed below.
+
+EPS_P, EPS_V = SIGMA_TRUE, SIGMA_TRUE
 U_MAX, Q_MAX, QD_MAX = 5.0, 1.2, 2.0
 A0 = np.block([[np.eye(2), TS * np.eye(2)], [np.zeros((2, 2)), np.eye(2)]])
 B0 = np.vstack([TS ** 2 / 2 * np.eye(2), TS * np.eye(2)])
@@ -206,53 +398,60 @@ def collect(T, seed, amp=0.7, pt=None):
 print("=" * 74)
 theta_info = _check_true_in_theta()
 print("=" * 74)
+if not np.isclose(SIGMA_TRUE, 1.0e-5):
+    print(f"[note] SIGMA_TRUE = {SIGMA_TRUE:.1e} but Sec. V-C states a")
+    print(f"       simulated covariance of (1e-5)^2 I.  With SIGMA_TRUE == "
+          f"SIGMA_HAT = {SIGMA_HAT:.1e} the claimed 20x prior conservatism")
+    print("       is NOT reproduced.  Reconcile script and manuscript.")
+print(f"[config] ablation = {ABLATION}   enforce_lemma1 = {ENFORCE_LEMMA1}")
 print("Collecting PE data (no injected disturbance)...")
 X_id, U_id, Xtrue_id = collect(T=T_ID, seed=11, amp=0.7)
 X_va, U_va, Xtrue_va = collect(T=T_VAL, seed=42, amp=0.6)
 
 Y0, Y1, U0 = X_id[:-1].T, X_id[1:].T, U_id.T
 n, m = Y0.shape[0], U0.shape[0]
+Z_reg = np.vstack([Y0, U0])                      # regressors z_k = [y_k; u_k]
+
+# Assumption 4 check
+rank_Z = np.linalg.matrix_rank(Z_reg)
+print(f"[Assumption 4] rank(Z_0) = {rank_Z} / {n + m} -> "
+      f"{'SATISFIED' if rank_Z == n + m else 'VIOLATED'}")
 
 # ============================================================================
-# 3. Noise envelope and calibration of omega_hat
+# 3. Noise envelope (Lemma 2) and calibration of omega_hat
 # ============================================================================
 eta_a = norm.ppf(1.0 - DELTA_A / (2.0 * n * (T_ID + K_BAR)))
 
-sigma_vec = np.array([EPS_P, EPS_P, EPS_V, EPS_V])
-sigma_hat = sigma_vec.max()
+sigma_vec = np.full(n, SIGMA_TRUE)
+sigma_hat = SIGMA_HAT
 if ISOTROPIC:
-    sd = np.full(n, sigma_hat * np.sqrt(1.0 + KAPPA ** 2))   # Lemma 2
+    # Lemma 2, eq. (10):  Cov(varsigma_k) <= sigma_hat^2 (1 + kappa_hat^2) I
+    sd = np.full(n, sigma_hat * np.sqrt(1.0 + KAPPA ** 2))
 else:
     sd = np.sqrt(sigma_vec ** 2 + KAPPA ** 2 * sigma_hat ** 2)
 noise_hw = eta_a * sd
 
+# --- Lemma 1 (restated, per-sample):  Cov(w~_k) <= Sigma_bar
+#     Sigma_bar = sigma_hat^2 (1 + kappa_hat^2) I_n.
+#     Imposed on (11) as Sigma_kappa >= Sigma_bar, which in the tau
+#     parameterisation is simply tau_i >= eta_a sqrt(Sigma_bar_ii).
+Sigma_bar_diag = sigma_hat ** 2 * (1.0 + KAPPA ** 2) * np.ones(n)
+tau_floor = eta_a * np.sqrt(Sigma_bar_diag)          # == noise_hw here
+assert np.allclose(tau_floor, noise_hw), \
+    "Lemma-1 floor and Lemma-2 envelope must coincide under Assumption 2"
 
-if EPS_P != EPS_V and ISOTROPIC:
-    print("[warn] simulated noise is anisotropic -> Assumption 2 violated as "
-          "stated; Lemma 2 still holds via sigma_hat = max_i sigma_i, "
-          "Lemma 1 does not.")
+# The old stacked bound, retained ONLY to report that it is strictly looser.
+lemma1_old = sigma_hat ** 2 * (1.0 + KAPPA) ** 2
+lemma1_ratio = float(np.sqrt(lemma1_old / Sigma_bar_diag[0]))
 
+if not ISOTROPIC:
+    print("[warn] anisotropic noise: Assumption 2 as stated is violated; "
+          "Lemma 2 still holds via sigma_hat = max_i sigma_i.")
 
-def chebyshev_eps(Xn, Un):
-    """min_Theta max_k |y_{k+1,a} - Theta z_k| per coordinate (one LP/row)."""
-    Ya0, Ya1, Ua0 = Xn[:-1].T, Xn[1:].T, Un.T
-    Tn = Ya0.shape[1]
-    Zc = np.vstack([Ya0, Ua0])
-    dd = Zc.shape[0]
-    A_ub = np.block([[Zc.T, -np.ones((Tn, 1))],
-                     [-Zc.T, -np.ones((Tn, 1))]])
-    c_lp = np.zeros(dd + 1)
-    c_lp[-1] = 1.0
-    out = []
-    for a in range(Ya1.shape[0]):
-        res = linprog(c_lp, A_ub=A_ub,
-                      b_ub=np.concatenate([Ya1[a, :], -Ya1[a, :]]),
-                      bounds=[(None, None)] * dd + [(0.0, None)],
-                      method="highs")
-        if not res.success:
-            raise RuntimeError(f"Chebyshev LP failed on row {a}: {res.message}")
-        out.append(res.x[-1])
-    return np.array(out)
+status = ("[MATCHED to beta]" if MATCHED_THETA
+          else "[MISMATCHED -- 'sensitivity only']")
+print(f"Corner-ensemble calibration over +/-{THETA_MASS_CAL:.0%} mass, "
+      f"+/-{THETA_LC2_CAL:.0%} lc2 {status}...")
 
 
 def theta_corners(th_m, th_l):
@@ -263,53 +462,45 @@ def theta_corners(th_m, th_l):
             for f3 in (1 - th_l, 1 + th_l)]
 
 
-# Pull the logic out to avoid f-string quote collisions
-status = "[MATCHED to beta]" if MATCHED_THETA else "[MISMATCHED -- 'sensitivity only']"
-
-print(f"Corner-ensemble calibration over +/-{THETA_MASS_CAL:.0%} mass, "
-      f"+/-{THETA_LC2_CAL:.0%} lc2 "
-      f"{status}...")
 cal_corners = theta_corners(THETA_MASS_CAL, THETA_LC2_CAL)
 eps_min_cal = np.zeros(n)
 eps_per_corner = []
 for pt_c in cal_corners:
-    # CAL_SEED fixed across corners -> identical excitation, so the spread is
-    # purely parametric.
     X_c, U_c, _ = collect(T=T_CAL, seed=CAL_SEED, amp=0.7, pt=pt_c)
     e_c = chebyshev_eps(X_c, U_c)
     eps_per_corner.append(e_c)
     eps_min_cal = np.maximum(eps_min_cal, e_c)
 eps_per_corner = np.array(eps_per_corner)
 
-eps_min_id = chebyshev_eps(X_id, U_id)   # reported only, never used downstream
+# --- M1 item 7: the Chebyshev floor on the identification record.  No
+#     data-consistent envelope can be smaller; eps_bar / floor is the
+#     headroom quoted in prose as "a factor of 3.1-18".
+eps_floor_id = chebyshev_eps(X_id, U_id)
 
-# The calibration deliberately does NOT subtract the measurement envelope:
-# eps_min bounds discrepancy AND noise jointly and the two are not separable
-# from noisy data.  SAFETY absorbs that double-count and the horizon
-# extrapolation from T_CAL to T_ID; the a-posteriori checks confirm it did.
 omega_bar = np.maximum(SAFETY * eps_min_cal, OMEGA_FLOOR)
 eps_bar = omega_bar + noise_hw
 g = GEN_SCALE * omega_bar
 G_omega = np.diag(g)
+headroom_floor = eps_bar / np.maximum(eps_floor_id, 1e-300)
 
 print(f"[envelope] eta_a={eta_a:.4f}  isotropic={ISOTROPIC}  "
       f"sigma_hat={sigma_hat:.3e}  SAFETY={SAFETY}")
 print(f"           noise hw (Lemma 2)      = {noise_hw}")
+print(f"           Lemma-1 floor on tau    = {tau_floor}")
+print(f"           old stacked (1+k)^2 bnd = {lemma1_ratio:.3f}x looser "
+      f"-> not used")
 print(f"           eps_min (calib, T={T_CAL:4d}) = {eps_min_cal}")
 print(f"           eps_min corner spread   = "
       f"{eps_per_corner.max(0) / np.maximum(eps_per_corner.min(0), 1e-300)}")
-print(f"           eps_min (ident, T={T_ID:4d}) = {eps_min_id}   <- not used")
-print(f"           calib/ident ratio       = "
-      f"{eps_min_cal / np.maximum(eps_min_id, 1e-300)}")
+print(f"           Chebyshev floor (ident) = {eps_floor_id}")
+print(f"           headroom eps_bar/floor  = {headroom_floor}")
 print(f"           omega_hat (calibrated)  = {omega_bar}")
 print(f"           eps_bar                 = {eps_bar}")
 
-
-
 # ============================================================================
-# 4. Theorem-1 SDP, region route
+# 4. Theorem-1 identification program (region route)
+#    tau_i := eta_a sqrt(e_i^T Sigma_kappa e_i);  SOCP/QP, not an SDP.
 # ============================================================================
-print("\nConfiguring SDP (Theorem 1, region route)...")
 generators = []
 for i in range(n):
     for j in range(n):
@@ -328,66 +519,88 @@ for k in range(T_ID):
     for j, (GA, GB) in enumerate(generators):
         V[k, :, j] = GA @ Y0[:, k] + GB @ U0[:, k]
 
-SB = sigma_hat                                  # nondimensionalisation scale
-C_A = cp.Variable((n, n))
-C_B = cp.Variable((n, m))
-s_h = cp.Variable(q, nonneg=True)               # s = SB * s_h
-Sig_h = cp.Variable((n, n), PSD=True)           # Sigma = SB^2 * Sig_h
-c_h = cp.Variable(n)                            # c_omega = SB * c_h
-t_h = cp.Variable(n, nonneg=True)
-
-cons = [cp.bmat([[Sig_h, cp.diag(t_h)], [cp.diag(t_h), np.eye(n)]]) >> 0]
-
-
-if OPTIMIZE_G:
-    g_h = cp.Variable(n, nonneg=True)
-    zeta = cp.Variable((n, T_ID))
-    cons += [cp.abs(zeta[i, :]) <= g_h[i] for i in range(n)]
-    bounded_term = zeta
+if ABLATION == "prior_only":
+    print("\n[ABLATION] prior_only: skipping (11) entirely.")
+    print("           h_wtilde := eps_bar (Lemma-2 envelope), c := 0,")
+    print("           predictor := nominal (A0, B0).")
+    A_hat, B_hat = A0.copy(), B0.copy()
+    s_star = np.zeros(q)
+    c_om = np.zeros(n)
+    g_out = g.copy()
+    D_kappa = noise_hw.copy()
+    solve_status = "skipped"
 else:
-    lambdas = cp.Variable((n, T_ID))
-    cons += [lambdas <= 1, lambdas >= -1]
-    bounded_term = cp.diag(g / SB) @ lambdas
+    print("\nConfiguring identification program (Theorem 1, region route)...")
+    SB = sigma_hat                              # nondimensionalisation scale
+    C_A = cp.Variable((n, n))
+    C_B = cp.Variable((n, m))
+    s_h = cp.Variable(q, nonneg=True)           # s = SB * s_h
+    tau_h = cp.Variable(n, nonneg=True)         # tau = SB * tau_h
+    c_h = cp.Variable(n)                        # c_omega = SB * c_h
 
-for k in range(T_ID):
-    r_k = (Y1[:, k] - C_A @ Y0[:, k] - C_B @ U0[:, k]) / SB
-    for i in range(n):
-        cons.append(
-            cp.abs(r_k[i] - c_h[i] - bounded_term[i, k])
-            <= eta_a * t_h[i] - (s_h @ np.abs(V[k, i, :])))
+    cons = []
+    # --- Lemma 1 (per-sample covariance bound), imposed:
+    if ENFORCE_LEMMA1:
+        cons.append(tau_h >= tau_floor / SB)
 
+    if OPTIMIZE_G:
+        g_h = cp.Variable(n, nonneg=True)
+        zeta = cp.Variable((n, T_ID))
+        cons += [cp.abs(zeta[i, :]) <= g_h[i] for i in range(n)]
+        bounded_term = zeta
+    else:
+        lambdas = cp.Variable((n, T_ID))
+        cons += [lambdas <= 1, lambdas >= -1]
+        bounded_term = cp.diag(g / SB) @ lambdas
 
-if OPTIMIZE_G:
-    cons.append(g_h + eta_a * cp.sqrt(cp.diag(Sig_h))
-                >= eps_bar / SB + cp.abs(c_h))
-    obj = cp.sum(g_h) + eta_a * cp.sum(t_h) + cp.sum(s_h)
-    if LAMBDA_REG:
-        obj = obj + cp.sum(cp.abs(zeta)) / T_ID
-else:
-    cons.append(eta_a * cp.sqrt(cp.diag(Sig_h))
-                >= eps_bar / SB + cp.abs(c_h) - np.abs(g) / SB)
-    obj = cp.sum(s_h) + cp.trace(Sig_h)
-    if LAMBDA_REG:
-        obj = obj + cp.sum(cp.abs(lambdas)) / T_ID
+    # (11c)+(11d): residual consistency
+    for k in range(T_ID):
+        r_k = (Y1[:, k] - C_A @ Y0[:, k] - C_B @ U0[:, k]) / SB
+        for i in range(n):
+            cons.append(cp.abs(r_k[i] - c_h[i] - bounded_term[i, k])
+                        <= tau_h[i] - (s_h @ np.abs(V[k, i, :])))
 
-print("Solving SDP...")
-prob = cp.Problem(cp.Minimize(obj), cons)
-prob.solve(solver=cp.CLARABEL, verbose=False)
-if prob.status not in ("optimal", "optimal_inaccurate"):
-    raise RuntimeError(f"Theorem-1 SDP failed: status={prob.status}")
-if prob.status == "optimal_inaccurate":
-    print("[warn] Theorem-1 SDP returned optimal_inaccurate")
+    # (11f): coverage of the Lemma-2 envelope
+    if OPTIMIZE_G:
+        cons.append(g_h + tau_h >= eps_bar / SB + cp.abs(c_h))
+        obj = (cp.sum(g_h) + LAMBDA_SIGMA * cp.sum_squares(tau_h) / eta_a ** 2
+               + cp.sum(s_h))
+        if LAMBDA_REG:
+            obj = obj + cp.sum(cp.abs(zeta)) / T_ID
+    else:
+        cons.append(tau_h >= eps_bar / SB + cp.abs(c_h) - np.abs(g) / SB)
+        obj = (cp.sum(s_h)
+               + LAMBDA_SIGMA * cp.sum_squares(tau_h) / eta_a ** 2)
+        if LAMBDA_REG:
+            obj = obj + cp.sum(cp.abs(lambdas)) / T_ID
 
-A_hat, B_hat = C_A.value, C_B.value
-s_star = np.maximum(s_h.value, 0.0) * SB
-Sig = Sig_h.value * SB ** 2
-c_om = c_h.value * SB
-g_out = (np.maximum(g_h.value, 0.0) * SB) if OPTIMIZE_G else g
-print(f"-> active s_i={int((s_star > 1e-9).sum())}/{q}, "
-      f"sum(s*)={s_star.sum():.3e}   (s* -> 0: nothing bounds M from below; "
-      f"the generator route is void, see note in source)")
+    print("Solving (SOCP/QP -- no LMI; see revision note 2)...")
+    prob = cp.Problem(cp.Minimize(obj), cons)
+    prob.solve(solver=cp.CLARABEL, verbose=False)
+    if prob.status not in ("optimal", "optimal_inaccurate"):
+        raise RuntimeError(f"Theorem-1 program failed: status={prob.status}")
+    if prob.status == "optimal_inaccurate":
+        print("[warn] returned optimal_inaccurate")
+    solve_status = prob.status
 
-D_kappa = eta_a * np.sqrt(np.maximum(np.diag(Sig), 0.0))
+    A_hat, B_hat = C_A.value, C_B.value
+    s_star = np.maximum(s_h.value, 0.0) * SB
+    c_om = c_h.value * SB
+    g_out = (np.maximum(g_h.value, 0.0) * SB) if OPTIMIZE_G else g
+    D_kappa = tau_h.value * SB
+    print(f"-> active s_i={int((s_star > 1e-9).sum())}/{q}, "
+          f"sum(s*)={s_star.sum():.3e}")
+    # Sigma*_kappa recovered from tau*
+    Sigma_star_diag = (D_kappa / eta_a) ** 2
+    at_floor = np.allclose(Sigma_star_diag, Sigma_bar_diag, rtol=2e-2)
+    print("-> Sigma*_kappa diag = "
+          f"{np.array2string(Sigma_star_diag, precision=3, suppress_small=False)}")
+    print("   Lemma-1 floor     = "
+          f"{np.array2string(Sigma_bar_diag, precision=3, suppress_small=False)}")
+    print(f"   at the floor?      {'YES' if at_floor else 'no'}"
+          + ("   (=> Sigma_kappa is data, not a decision variable;"
+             " state it as such)" if at_floor else ""))
+
 hw_dd = np.abs(g_out) + D_kappa
 c_dd = c_om.copy()
 
@@ -398,26 +611,42 @@ def residuals(X, U, A, B):
 
 # --------------------------------------------------- which constraint binds --
 R_id = Y1 - A_hat @ Y0 - B_hat @ U0                    # n x T
-cov_hw = eps_bar + np.abs(c_om)                        # (10h) route
-data_hw = np.abs(R_id - c_om[:, None]).max(axis=1)     # (10f) route
+cov_hw = eps_bar + np.abs(c_om)                        # (11f) route
+data_hw = np.abs(R_id - c_om[:, None]).max(axis=1)     # (11d) route
+
+# --- M1 item 3: BUG FIX.  Two rows, two labels (was three labels).
 routes = np.vstack([cov_hw, data_hw])
-which = np.array(["floor", "(10h)", "(10f)"])[np.argmax(routes, axis=0)]
+which = [["coverage(11f)", "residual(11d)"][j]
+         for j in np.argmax(routes, axis=0)]
 data_margin = data_hw / np.maximum(cov_hw, 1e-300) - 1.0
 
 print("\n[binding constraint, per coordinate]")
 print(f"        achieved h_wtilde        = {hw_dd}")
-print(f"        coverage (10h) route     = {cov_hw}")
-print(f"        residual (10f) route     = {data_hw}")
+print(f"        coverage (11f) route     = {cov_hw}")
+print(f"        residual (11d) route     = {data_hw}")
 print(f"        active                   = {which}")
 print(f"        data contribution        = {data_margin}"
-      f"   (<= 0 everywhere => SDP is inert)")
+      f"   (<= 0 everywhere => identification is inert)")
 
+audit = audit_theorem1(g=g_out, hw=hw_dd, c_om=c_om, eps_bar=eps_bar,
+                       R_id=R_id, eta_a=eta_a, s_star=s_star,
+                       sigma_bar_hw=tau_floor)
+audit["ablation"] = ABLATION
+audit["solve_status"] = solve_status
+audit["headroom_floor"] = headroom_floor.tolist()
+audit["lemma1_old_over_new"] = lemma1_ratio
 
+# --- regression guard: if the binding route ever changes, the prose in
+#     Section V-B and Table 1 must be revisited.
+EXPECTED_INERT = True
+if audit["sdp_inert"] != EXPECTED_INERT:
+    print("\n[REGRESSION] binding route changed vs EXPECTED_INERT="
+          f"{EXPECTED_INERT}; Section V-B text and Table 1 need revisiting.")
 
 # ============================================================================
 # 5. Contraction metric P
 # ============================================================================
-print("\nSolving App.-B SDP for P...")
+print("\nSolving SDP for the contraction metric P...")
 thetas = theta_corners(THETA_MASS, THETA_LC2)
 Ns = 4000
 qs = np.c_[rng.uniform(-Q_MAX, Q_MAX, Ns), rng.uniform(-Q_MAX, Q_MAX, Ns)]
@@ -469,7 +698,7 @@ for rho in np.linspace(0.8, 0.97, 12):
     if P is not None:
         break
 if P is None:
-    raise RuntimeError("App.-B SDP infeasible for every rho in the sweep.")
+    raise RuntimeError("Contraction-metric SDP infeasible for every rho.")
 print(f"   contraction rate rho = {rho_used:.4f}")
 
 Psqrt = np.real(sqrtm(P))
@@ -520,7 +749,8 @@ print(f"   a={a:.4e} b={b:.4e} c={c:.4e}")
 # ============================================================================
 W_id = residuals(X_id, U_id, A_hat, B_hat)
 qd_true = Xtrue_id[:-1, 2:]        # beta is stated at EXACT states
-beta = a * np.linalg.norm(U_id, axis=1) + b * np.linalg.norm(qd_true, axis=1) + c
+beta = (a * np.linalg.norm(U_id, axis=1)
+        + b * np.linalg.norm(qd_true, axis=1) + c)
 wP = pnorm(W_id)
 
 D_true = Xtrue_id[1:] - Xtrue_id[:-1] @ A0.T - U_id @ B0.T
@@ -531,7 +761,7 @@ rad_disc = prad(np.zeros(n), disc_hw)
 rad_omega = prad(np.zeros(n), omega_bar)
 rad_dd_P = prad(c_dd, hw_dd)
 rad_noise = prad(np.zeros(n), D_kappa)
-rad_data = prad(c_om, data_hw)          # (10f) counterfactual
+rad_data = prad(c_om, data_hw)          # (11d) counterfactual
 
 ratio_I_max = beta.max() / rad_omega
 ratio_I_med = np.median(beta) / rad_omega
@@ -546,22 +776,44 @@ beta_aug = beta + rad_noise
 
 W_va = residuals(X_va, U_va, A_hat, B_hat)
 cov_dd = 100 * np.all(np.abs(W_va - c_dd) <= hw_dd + 1e-12, axis=1).mean()
-
 cov_data = 100 * np.all(np.abs(W_va - c_om) <= data_hw + 1e-12, axis=1).mean()
 
 noise_content = np.minimum(noise_hw / np.maximum(omega_bar, 1e-300), 1.0)
 disc_share = np.minimum(disc_hw / np.maximum(omega_bar, 1e-300), 1.0)
+cov_beta_true = 100 * np.mean(dP_true <= beta)
 
-cov_beta_true = 100 * np.mean(dP_true <= beta)   # the meaningful check
+# --- data-feasible set F and its interval hull (14), plus the support gap ---
+print("\nComputing the data-feasible set F and its interval hull (14)...")
+Theta_bar_F, Gamma_F = feasible_hull(Y1, Z_reg, eps_bar)
+Theta_star_true = np.hstack([A0, B0])
+in_hull = bool(np.all(np.abs(Theta_star_true - Theta_bar_F)
+                      <= Gamma_F + 1e-12))
+print(f"   Gamma max entry            = {Gamma_F.max():.4e}")
+print(f"   |Theta* - Theta_bar| max   = "
+      f"{np.abs(Theta_star_true - Theta_bar_F).max():.4e}")
+print(f"   true parameters inside hull: {'YES' if in_hull else 'NO'}")
+
+sgap = None
+if RUN_SUPPORT_GAP:
+    sgap = support_gap(Y1, Z_reg, eps_bar, Theta_bar_F, Gamma_F,
+                       n_samples=SUPPORT_SAMPLES)
 
 lines = [
     "=== Table 1 (region route): comparisons in the P-weighted norm ===",
+    f"ablation = {ABLATION}   enforce_lemma1 = {ENFORCE_LEMMA1}",
     f"eta_a = {eta_a:.4f}   isotropic = {ISOTROPIC}   kappa_hat = {KAPPA}"
     f"   optimise_g = {OPTIMIZE_G}   SAFETY = {SAFETY}",
+    f"sigma_true = {SIGMA_TRUE:.2e}   sigma_hat = {SIGMA_HAT:.2e}",
     f"Theta (beta)  = +/-{THETA_MASS:.0%} mass, +/-{THETA_LC2:.0%} lc2",
     f"Theta (prior) = +/-{THETA_MASS_CAL:.0%} mass, +/-{THETA_LC2_CAL:.0%} lc2"
-    f"   {'[MATCHED]' if MATCHED_THETA else '[MISMATCHED -- sensitivity only]'}",
+    f"   {'[MATCHED]' if MATCHED_THETA else '[MISMATCHED]'}",
     f"analytical constants  a={a:.4e}  b={b:.4e}  c={c:.4e}",
+    "",
+    "(0) LEMMA 1 (per-sample covariance bound), imposed on (11)",
+    f"    Sigma_bar diag              = "
+    f"{np.array2string(Sigma_bar_diag, precision=3, suppress_small=False)}",
+    f"    tau floor = eta_a sqrt(.)   = {tau_floor}",
+    f"    old stacked (1+k)^2 route   = {lemma1_ratio:.3f}x looser, unused",
     "",
     "(I) DISCREPANCY ONLY",
     f"    omega_hat (calibrated)      = {omega_bar}",
@@ -577,9 +829,9 @@ lines = [
     f"median {np.median(beta) / rad_disc:.2f}x",
     "",
     "(II) FULL EFFECTIVE UNCERTAINTY",
-    f"    h_wtilde = |g| + eta_a sqrt(Sigma_ii) = {hw_dd}",
-    f"      of which measurement noise          = {D_kappa}",
-    f"      eps_bar (Lemma 2 envelope)          = {eps_bar}",
+    f"    h_wtilde = |g| + tau        = {hw_dd}",
+    f"      of which measurement noise = {D_kappa}",
+    f"      eps_bar (Lemma 2 envelope) = {eps_bar}",
     f"    P-radius Z_wtilde           = {rad_dd_P:.4e}",
     f"      of which noise alone      = {rad_noise:.4e}  "
     f"({100 * rad_noise / rad_dd_P:.0f}% of the set)",
@@ -587,19 +839,32 @@ lines = [
     f"median {ratio_II_med:.2f}x",
     "",
     "(III) LIKE-FOR-LIKE -- both descriptions cover discrepancy + noise",
-    f"      noise envelope P-radius     = {rad_noise:.4e}",
+    f"      noise envelope P-radius   = {rad_noise:.4e}",
     f"      beta (+) N : max {beta_aug_max:.4e}   med {beta_aug_med:.4e}",
-    f"      Z_wtilde                    = {rad_dd_P:.4e}",
-    f"      conservatism ratio          : max {ratio_III_max:.2f}x , "
+    f"      Z_wtilde                  = {rad_dd_P:.4e}",
+    f"      conservatism ratio        : max {ratio_III_max:.2f}x , "
     f"median {ratio_III_med:.2f}x",
     "",
     "(IV) COUNTERFACTUAL -- what the residuals alone would support",
-    f"      (10f) half-widths           = {data_hw}",
-    f"      P-radius of (10f) set       = {rad_data:.4e}",
+    f"      (11d) half-widths           = {data_hw}",
+    f"      P-radius of (11d) set       = {rad_data:.4e}",
     f"      tightening vs Z_wtilde      = {rad_dd_P / rad_data:.2f}x",
-    f"      validation coverage of (10f) set = {cov_data:.1f}%  "
+    f"      validation coverage of (11d) set = {cov_data:.1f}%  "
     f"(target {100 * (1 - DELTA_A):.0f}%)",
-    f"      binding route per coord     = {list(which)}",
+    f"      binding route per coord     = {which}",
+    f"      Chebyshev floor             = {eps_floor_id}",
+    f"      headroom eps_bar / floor    = {headroom_floor}"
+    f"   ({headroom_floor.min():.1f}x to {headroom_floor.max():.1f}x)",
+    "",
+    "(V) INTERVAL-HULL CONSERVATISM IN (14)  [T3]",
+    f"      Gamma max entry             = {Gamma_F.max():.4e}",
+    f"      true params inside hull     = {in_hull}",
+]
+if sgap is not None:
+    lines += [f"      box/exact support ratio     : median "
+              f"{sgap['median']:.2f}x  range {sgap['min']:.2f}-"
+              f"{sgap['max']:.2f}x"]
+lines += [
     "",
     f"beta(x,u) along traj : med={np.median(beta):.4e}  max={beta.max():.4e}",
     f"||w_tilde||_P        : med={np.median(wP):.4e}  max={wP.max():.4e}",
@@ -608,6 +873,11 @@ lines = [
     f"coverage ||d_k||_P <= beta      : {cov_beta_true:.1f}%",
     f"Z_wtilde validation coverage    : {cov_dd:.1f}%  "
     f"(target {100 * (1 - DELTA_A):.0f}%)",
+    "",
+    "M1 VERDICT: " + ("identification INERT -- (11f) binds everywhere; "
+                      "restate Contribution 1"
+                      if audit["sdp_inert"] else
+                      "(11d) binds somewhere -- data does constrain"),
 ]
 summary = "\n".join(lines)
 print("\n" + summary)
@@ -684,7 +954,7 @@ if VERIFY_A3:
                 + f"\n  worst |d_k| traj     = {worst_traj}"
                 + f"\n  omega_hat            = {omega_bar}")
 
-with open(OUT_DIR / "summary.txt", "w") as f:
+with open(OUT_DIR / f"summary_{ABLATION}.txt", "w") as f:
     f.write(summary + "\n")
 
 # ============================================================================
@@ -692,19 +962,29 @@ with open(OUT_DIR / "summary.txt", "w") as f:
 # ============================================================================
 res = dict(
     config=dict(eta_a=float(eta_a), kappa=KAPPA, delta_a=DELTA_A,
-                safety=SAFETY, isotropic=ISOTROPIC, optimize_g=OPTIMIZE_G, lambda_reg=LAMBDA_REG,
+                safety=SAFETY, isotropic=ISOTROPIC, optimize_g=OPTIMIZE_G,
+                lambda_reg=LAMBDA_REG, lambda_sigma=LAMBDA_SIGMA,
                 T_id=T_ID, T_cal=T_CAL, matched_theta=MATCHED_THETA,
                 theta_mass=THETA_MASS, theta_lc2=THETA_LC2,
                 theta_mass_cal=THETA_MASS_CAL, theta_lc2_cal=THETA_LC2_CAL,
-                rho=float(rho_used), sigma_hat=float(sigma_hat)),
+                rho=float(rho_used), sigma_hat=float(sigma_hat),
+                sigma_true=float(SIGMA_TRUE), ablation=ABLATION,
+                enforce_lemma1=ENFORCE_LEMMA1),
+    lemma1=dict(Sigma_bar_diag=Sigma_bar_diag.tolist(),
+                tau_floor=tau_floor.tolist(),
+                old_stacked_ratio=lemma1_ratio),
+    audit=audit,
+    support_gap=sgap,
     theta_check=theta_info,
     abc=dict(a=float(a), b=float(b), c=float(c)),
     omega_hat=omega_bar.tolist(),
-    eps_min_cal=eps_min_cal.tolist(), eps_min_id=eps_min_id.tolist(),
+    eps_min_cal=eps_min_cal.tolist(), eps_floor_id=eps_floor_id.tolist(),
+    headroom_floor=headroom_floor.tolist(),
     h_wtilde=hw_dd.tolist(), data_hw=data_hw.tolist(), cov_hw=cov_hw.tolist(),
-    binding_route=list(which), data_margin=data_margin.tolist(),
+    binding_route=which, data_margin=data_margin.tolist(),
     realised_disc_box=disc_hw.tolist(),
     noise_content=noise_content.tolist(),
+    gamma_max=float(Gamma_F.max()), true_in_hull=in_hull,
     radii=dict(omega=float(rad_omega), Z=float(rad_dd_P),
                noise=float(rad_noise), data=float(rad_data),
                disc=float(rad_disc), beta_max=float(beta.max()),
@@ -721,7 +1001,7 @@ res = dict(
                   d_med=float(np.median(dP_true)), d_max=float(dP_true.max())),
     assumption3=a3,
 )
-with open(OUT_DIR / "table1_numbers.json", "w") as f:
+with open(OUT_DIR / f"table1_numbers_{ABLATION}.json", "w") as f:
     json.dump(res, f, indent=2)
 
 
@@ -750,10 +1030,29 @@ macros = {
     "TabCovZ": f"{cov_dd:.0f}", "TabCovData": f"{cov_data:.0f}",
     "TabEtaA": f"{eta_a:.3f}",
     "TabConstA": _sci(a), "TabConstB": _sci(b), "TabConstC": _sci(c),
+    # --- M1 additions: the numbers the revised prose must quote.
+    # CAREFUL: two DIFFERENT "headroom" quantities, do not interchange them.
+    #  (a) TabMargin* = coverage(11f) / residual(11d).  This is the factor
+    #      quoted in Sec. V-B ("the required margin is a factor of 3.1-18"),
+    #      i.e. how far the residuals would have to grow before (11d) binds.
+    "TabMarginMin": f"{audit['headroom_min']:.1f}",
+    "TabMarginMax": f"{audit['headroom_max']:.1f}",
+    #  (b) TabFloorHeadroom* = eps_bar / Chebyshev floor.  A DIFFERENT and
+    #      larger number: how far the prior envelope sits above the smallest
+    #      data-consistent envelope.  New diagnostic; not the Sec. V-B factor.
+    "TabFloorHeadroomMin": f"{headroom_floor.min():.1f}",
+    "TabFloorHeadroomMax": f"{headroom_floor.max():.1f}",
+    "TabLemmaOneRatio": f"{lemma1_ratio:.2f}",
+    "TabTauFloor": _sci(float(tau_floor[0])),
+    "TabIdentInert": "yes" if audit["sdp_inert"] else "no",
 }
-with open(OUT_DIR / "table1_macros.tex", "w") as f:
-    f.write("% auto-generated -- do not edit; regenerate with "
-            "table1_conservatism.py\n")
+if sgap is not None:
+    macros["TabSupportGapMed"] = f"{sgap['median']:.1f}"
+    macros["TabSupportGapMin"] = f"{sgap['min']:.1f}"
+    macros["TabSupportGapMax"] = f"{sgap['max']:.1f}"
+
+with open(OUT_DIR / f"table1_macros_{ABLATION}.tex", "w") as f:
+    f.write("% auto-generated -- do not edit; regenerate with this script\n")
     for k, v in macros.items():
         f.write(f"\\newcommand{{\\{k}}}{{{v}}}\n")
 
@@ -825,10 +1124,13 @@ axT.legend(loc="lower left", bbox_to_anchor=(0.0, 0.0), ncol=3,
            labelspacing=0.25)
 
 for ext in ("pdf", "png"):
-    fig.savefig(OUT_DIR / f"fig1_residual_sets.{ext}")
+    fig.savefig(OUT_DIR / f"fig1_residual_sets_{ABLATION}.{ext}")
 
-print(f"\nWritten to {OUT_DIR}:")
-print("  fig1_residual_sets.pdf/.png")
-print("  summary.txt")
-print("  table1_numbers.json      (machine-readable, for regression checks)")
-print("  table1_macros.tex        (\\input this so the paper cannot drift)")
+print(f"\nWritten to {OUT_DIR} (ablation={ABLATION}):")
+print(f"  fig1_residual_sets_{ABLATION}.pdf/.png")
+print(f"  summary_{ABLATION}.txt")
+print(f"  table1_numbers_{ABLATION}.json   (machine-readable)")
+print(f"  table1_macros_{ABLATION}.tex     (\\input this so the paper "
+      f"cannot drift)")
+print("\nTo run the ablation:  THM1_ABLATION=prior_only python "
+      "9_compare_wtilde_vs_delta.py")
