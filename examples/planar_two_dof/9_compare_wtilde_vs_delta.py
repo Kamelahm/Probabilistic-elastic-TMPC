@@ -40,9 +40,6 @@ OPTIMIZE_G    = False
 LAMBDA_REG    = True      # L1 term on lambda in the objective
 LAMBDA_SIGMA  = 1.0       # lambda_sigma of (11a): stochastic vs deterministic
 
-# --- M1: ablation.  "prior_only" skips (11) entirely and uses the Lemma-2
-#     envelope directly.  If the closed-loop numbers are unchanged, the
-#     identification contributes nothing and Contribution 1 must be restated.
 ABLATION      = os.environ.get("THM1_ABLATION", "sdp")   # "sdp" | "prior_only"
 assert ABLATION in ("sdp", "prior_only")
 
@@ -353,13 +350,10 @@ def rk4_step(x, u, dt, nsub=10, pt=None):
 # ============================================================================
 TS = 0.01
 
-# --- M1 item 9: simulated noise vs a priori bound, kept explicitly distinct.
+# -- simulated noise vs a priori bound, kept explicitly distinct.
 SIGMA_TRUE = 2.0e-4       # what collect() actually injects
 SIGMA_HAT  = 2.0e-4       # Assumption 3 prior used by identification/tube
-# Set SIGMA_TRUE = 1.0e-5 to match the covariance stated in Sec. V-C.  Doing
-# so changes the reported numbers; the legacy value is kept as the default so
-# the existing Table 1 reproduces.  Whichever is chosen, the manuscript and
-# the script must agree -- see the warning printed below.
+
 
 EPS_P, EPS_V = SIGMA_TRUE, SIGMA_TRUE
 U_MAX, Q_MAX, QD_MAX = 5.0, 1.2, 2.0
@@ -418,7 +412,7 @@ print(f"[Assumption 4] rank(Z_0) = {rank_Z} / {n + m} -> "
       f"{'SATISFIED' if rank_Z == n + m else 'VIOLATED'}")
 
 # ============================================================================
-# 3. Noise envelope (Lemma 2) and calibration of omega_hat
+# 3. Noise envelope and calibration of omega_hat
 # ============================================================================
 eta_a = norm.ppf(1.0 - DELTA_A / (2.0 * n * (T_ID + K_BAR)))
 
@@ -431,10 +425,7 @@ else:
     sd = np.sqrt(sigma_vec ** 2 + KAPPA ** 2 * sigma_hat ** 2)
 noise_hw = eta_a * sd
 
-# --- Lemma 1 (restated, per-sample):  Cov(w~_k) <= Sigma_bar
-#     Sigma_bar = sigma_hat^2 (1 + kappa_hat^2) I_n.
-#     Imposed on (11) as Sigma_kappa >= Sigma_bar, which in the tau
-#     parameterisation is simply tau_i >= eta_a sqrt(Sigma_bar_ii).
+
 Sigma_bar_diag = sigma_hat ** 2 * (1.0 + KAPPA ** 2) * np.ones(n)
 tau_floor = eta_a * np.sqrt(Sigma_bar_diag)          # == noise_hw here
 assert np.allclose(tau_floor, noise_hw), \
@@ -472,9 +463,6 @@ for pt_c in cal_corners:
     eps_min_cal = np.maximum(eps_min_cal, e_c)
 eps_per_corner = np.array(eps_per_corner)
 
-# --- M1 item 7: the Chebyshev floor on the identification record.  No
-#     data-consistent envelope can be smaller; eps_bar / floor is the
-#     headroom quoted in prose as "a factor of 3.1-18".
 eps_floor_id = chebyshev_eps(X_id, U_id)
 
 omega_bar = np.maximum(SAFETY * eps_min_cal, OMEGA_FLOOR)
@@ -614,7 +602,6 @@ R_id = Y1 - A_hat @ Y0 - B_hat @ U0                    # n x T
 cov_hw = eps_bar + np.abs(c_om)                        # (11f) route
 data_hw = np.abs(R_id - c_om[:, None]).max(axis=1)     # (11d) route
 
-# --- M1 item 3: BUG FIX.  Two rows, two labels (was three labels).
 routes = np.vstack([cov_hw, data_hw])
 which = [["coverage(11f)", "residual(11d)"][j]
          for j in np.argmax(routes, axis=0)]
@@ -1030,16 +1017,10 @@ macros = {
     "TabCovZ": f"{cov_dd:.0f}", "TabCovData": f"{cov_data:.0f}",
     "TabEtaA": f"{eta_a:.3f}",
     "TabConstA": _sci(a), "TabConstB": _sci(b), "TabConstC": _sci(c),
-    # --- M1 additions: the numbers the revised prose must quote.
-    # CAREFUL: two DIFFERENT "headroom" quantities, do not interchange them.
-    #  (a) TabMargin* = coverage(11f) / residual(11d).  This is the factor
-    #      quoted in Sec. V-B ("the required margin is a factor of 3.1-18"),
-    #      i.e. how far the residuals would have to grow before (11d) binds.
+
     "TabMarginMin": f"{audit['headroom_min']:.1f}",
     "TabMarginMax": f"{audit['headroom_max']:.1f}",
-    #  (b) TabFloorHeadroom* = eps_bar / Chebyshev floor.  A DIFFERENT and
-    #      larger number: how far the prior envelope sits above the smallest
-    #      data-consistent envelope.  New diagnostic; not the Sec. V-B factor.
+
     "TabFloorHeadroomMin": f"{headroom_floor.min():.1f}",
     "TabFloorHeadroomMax": f"{headroom_floor.max():.1f}",
     "TabLemmaOneRatio": f"{lemma1_ratio:.2f}",
