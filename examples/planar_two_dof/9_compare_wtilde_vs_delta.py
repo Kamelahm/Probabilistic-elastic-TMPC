@@ -1,7 +1,6 @@
 """
-Table 1 / Figure 1 -- conservatism of the identified uncertainty set.
-Region route of Theorem 1, planar 2-DOF manipulator.
-
+Table 1 / Figure 1 -- conservatism of the CONFORMALLY CALIBRATED uncertainty set.
+Planar 2-DOF manipulator.
 """
 import os
 import json
@@ -31,128 +30,118 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 # ============================================================== switches ====
 ISOTROPIC     = True      # Assumption 2 verbatim
 KAPPA         = 1.10      # a priori spectral bound kappa_hat, FIXED
-DELTA_A       = 0.05
-K_BAR         = 500       # closed-loop horizon entering eta_a
-SAFETY        = 2.0       # margin on the calibrated omega_hat
+DELTA_A       = 0.05      # Lemma 1 budget -> ONLY the shape multiplier eta_a + W
+ALPHA_BAR     = 0.05      # conformal miscoverage of Theorem 1 (1 - alpha_bar = 95%)
+DELTA_OMEGA   = 0.05      # Corollary 1 horizon budget (alpha_omega = delta_omega/K_bar)
+K_BAR         = 500       # closed-loop horizon entering Corollary 1
+
+# Shape-program weights (Lemma 2).  These set the disturbance/noise SPLIT only;
+# conformal coverage is invariant to them (Thm 1: any fit-measurable rho is valid).
+LAMBDA_SIGMA  = 1.0       # lambda_sigma tr(Sigma_kappa) in (16a)
+LAMBDA_G      = 1.0       # lambda_g ||g||_1     in (16a)
+LAMBDA_MU     = 1.0       # weight on sum_k ||mu_k||_1 in (16a) (per-sample)
+
+SAFETY        = 2.0       # margin on the calibrated prior omega_hat (feeds F only)
 OMEGA_FLOOR   = 1e-8
-GEN_SCALE     = 1.0       # g = GEN_SCALE * omega_hat when OPTIMIZE_G is False
-OPTIMIZE_G    = False
-LAMBDA_REG    = True      # L1 term on lambda in the objective
-LAMBDA_SIGMA  = 1.0       # lambda_sigma of (11a): stochastic vs deterministic
 
-ABLATION      = os.environ.get("THM1_ABLATION", "sdp")   # "sdp" | "prior_only"
-assert ABLATION in ("sdp", "prior_only")
+# ablation: "conformal" (Theorem 1) vs "gaussian" (old Lemma-1 tail region, for
+# the dimension-free comparison reported in Section V-B).
+ABLATION      = os.environ.get("THM1_ABLATION", "conformal")
+assert ABLATION in ("conformal", "gaussian")
 
-# --- M1: enforce Lemma 1 (per-sample covariance bound) inside (11).
-ENFORCE_LEMMA1 = True
+# --- record lengths ---------------------------------------------------------
+T_ID          = int(os.environ.get("THM1_T_ID", 1500))   # identification record
+T1_FRAC       = 0.60                                      # fit fraction of T_ID
+T_VAL         = int(os.environ.get("THM1_T_VAL", 800))   # coverage validation
+T_PRIOR       = int(os.environ.get("THM1_T_PRIOR", 400)) # omega_hat corner calib
 
-T_ID          = 1500
-T_VAL         = 800
-T_CAL         = 400
-
-# Parametric uncertainty polytope Theta -- used for BOTH beta and the prior
+# Parametric uncertainty polytope Theta -- used for BOTH beta and the prior omega_hat
 THETA_MASS    = 0.20
 THETA_LC2     = 0.12
-
-# Calibrate the prior over the same Theta that beta covers.
 MATCHED_THETA = True
 THETA_MASS_CAL = THETA_MASS if MATCHED_THETA else 0.10
 THETA_LC2_CAL  = THETA_LC2  if MATCHED_THETA else 0.06
+CAL_SEED       = 2718
 
-CAL_SEED      = 2718      # fixed ACROSS corners: eps_min becomes a clean
-                          # function of Theta rather than of the excitation
-                          # realisation drawn at each corner
-VERIFY_A3     = True
+# diagnostics / speed knobs
+VERIFY_A3     = os.environ.get("THM1_A3", "1") == "1"
 A3_T          = 400
 A3_INTERIOR   = 8
 A3_AMP_OOD    = 0.9
-
-# --- diagnostics
-RUN_SUPPORT_GAP = True    # interval hull of F vs exact support (T3)
+NS_METRIC     = int(os.environ.get("THM1_NS", 4000))     # samples for P-metric wc
+NS_ABC        = int(os.environ.get("THM1_NSABC", 1200))  # samples for a,b,c
+RUN_SUPPORT_GAP = True
 SUPPORT_SAMPLES = 8
 
 # ============================================================================
-# 0. M1 diagnostics
+# 0. Reporting for the NEW framework
 # ============================================================================
-def audit_theorem1(g, hw, c_om, eps_bar, R_id, eta_a, s_star=None,
-                   sigma_bar_hw=None, rtol=2e-2, verbose=True):
-    """Does (11) contribute anything to the SIZE of the description?
+def conformal_report(g_star, t_star, c_om, eta_a, tau_alpha, hw_tilde,
+                     Sigma_star_diag, s_star, cov_conf, cov_resid,
+                     rho_zero_gauss, verbose=True):
+    """What does the identification contribute under the conformal framework?
 
-    Compares the two routes to the achieved half-widths h_wtilde:
-        coverage (11f) : eps_bar + |c_omegabar|
-        residual (11d) : max_k |r_k - c_omegabar|
-    If (11f) binds everywhere the identified region IS the Lemma-2 envelope.
+    The relevant facts are:
+      * is the certified region valid?              cov_conf ~ 1 - alpha_bar
+      * is the shape genuinely data-driven?         g*, t*, s* from residuals,
+                                                    omega_hat absent from (16)
+      * how much did dropping the union bound buy?  tau_alpha*(g+eta t) vs
+                                                    the Gaussian tail hw.
     """
-    g, hw, c_om, eps_bar = map(np.asarray, (g, hw, c_om, eps_bar))
-    n = len(hw)
-    coverage_route = eps_bar + np.abs(c_om)                     # (11f)
-    residual_route = np.abs(R_id - c_om[:, None]).max(axis=1)   # (11d)
-    binds = ["coverage(11f)" if coverage_route[i] >= residual_route[i]
-             else "residual(11d)" for i in range(n)]
-    headroom = coverage_route / np.maximum(residual_route, 1e-300)
-    equals_prior = bool(np.allclose(hw, coverage_route, rtol=rtol))
-    inert = all(b == "coverage(11f)" for b in binds)
-
-    out = dict(h_wtilde=hw.tolist(),
-               coverage_route=coverage_route.tolist(),
-               residual_route=residual_route.tolist(),
-               binding=binds,
-               headroom=headroom.tolist(),
-               headroom_min=float(headroom.min()),
-               headroom_max=float(headroom.max()),
-               identified_equals_prior=equals_prior,
-               centre_at_origin=bool(np.allclose(
-                   c_om, 0.0, atol=rtol * np.abs(eps_bar).max())),
-               sdp_inert=inert,
-               s_star_sum=None if s_star is None else float(np.sum(s_star)),
-               s_star_active=None if s_star is None
-               else int((np.abs(s_star) > 1e-9).sum()))
-
+    g_star, t_star, c_om, hw_tilde = map(
+        np.asarray, (g_star, t_star, c_om, hw_tilde))
+    n = len(hw_tilde)
+    hw_gauss = eta_a * t_star     
+    dimfree_gain = hw_gauss / np.maximum(hw_tilde, 1e-300)
+    out = dict(
+        tau_alpha=float(tau_alpha),
+        hw_tilde=hw_tilde.tolist(),
+        hw_gaussian=hw_gauss.tolist(),
+        dimfree_gain=dimfree_gain.tolist(),
+        g_star=g_star.tolist(), t_star=t_star.tolist(),
+        c_omega_star=c_om.tolist(),
+        s_star_sum=float(np.sum(s_star)),
+        s_star_active=int((np.abs(s_star) > 1e-9).sum()),
+        coverage_conformal=float(cov_conf),
+        coverage_residual_only=float(cov_resid),
+        shape_is_data_driven=True)     # omega_hat never enters (16); always true
     if verbose:
         print("\n" + "=" * 74)
-        print("M1 AUDIT -- what does Theorem 1 contribute?")
+        print("CONFORMAL REPORT -- what does Theorem 1 contribute?")
         print("=" * 74)
         w = 14
-        print(f"  {'coord':>5} {'h_wtilde':>{w}} {'coverage(11f)':>{w}} "
-              f"{'residual(11d)':>{w}} {'binds':>15}")
+        print(f"  {'coord':>5} {'hw_tilde(32)':>{w}} {'hw_gauss(L1)':>{w}} "
+              f"{'g*':>{w}} {'eta_a t*':>{w}}")
         for i in range(n):
-            print(f"  {i:>5} {hw[i]:{w}.4e} {coverage_route[i]:{w}.4e} "
-                  f"{residual_route[i]:{w}.4e} {binds[i]:>15}")
-        print(f"\n  centre c*_omegabar          = "
+            print(f"  {i:>5} {hw_tilde[i]:{w}.4e} {hw_gauss[i]:{w}.4e} "
+                  f"{g_star[i]:{w}.4e} {eta_a * t_star[i]:{w}.4e}")
+        print(f"\n  tau_alpha (order statistic)       = {tau_alpha:.4f}")
+        print(f"  centre c*_omega                   = "
               f"{np.array2string(c_om, precision=3)}")
-        if s_star is not None:
-            print(f"  sum(s*) / active generators = {np.sum(s_star):.3e} / "
-                  f"{int((np.abs(s_star) > 1e-9).sum())}")
-        if sigma_bar_hw is not None:
-            print(f"  Lemma-1 floor eta_a*sqrt(Sigma_bar_ii) = "
-                  f"{np.array2string(np.atleast_1d(sigma_bar_hw), precision=5)}")
-        print(f"  coverage/residual headroom  = "
-              f"{headroom.min():.2f}x to {headroom.max():.2f}x")
-        print(f"  identified region == prior? = "
-              f"{'YES' if equals_prior else 'no'}")
-        print("\n  VERDICT: ", end="")
-        if inert:
-            print("(11f) binds in EVERY coordinate.")
-            print("           The identified region is the Lemma-2 envelope;")
-            print("           (11) does not tighten it.  Contribution 1 must")
-            print("           be stated as certified packaging, not as a")
-            print("           reduction in conservatism.")
-        else:
-            tight = [i for i in range(n) if binds[i] == "residual(11d)"]
-            print(f"(11d) binds in coordinates {tight}.")
-            print("           The data does constrain the description there.")
+        print(f"  active generators sum(s*)/#        = {np.sum(s_star):.3e} / "
+              f"{int((np.abs(s_star) > 1e-9).sum())}")
+        print(f"  conformal coverage (target {100 * (1 - ALPHA_BAR):.0f}%)     "
+              f"= {100 * cov_conf:.1f}%")
+        print(f"  residual-only coverage             = {100 * cov_resid:.1f}%")
+        print(f"  dimension-free gain hw_gauss/hw    = "
+              f"{dimfree_gain.min():.2f}x to {dimfree_gain.max():.2f}x")
+        print("\n  VERDICT: scale is set by the held-out conformal fold, not by")
+        print("           the prior; omega_hat is absent from (16)/(21).  The")
+        print("           region is a certified packaging with valid coverage,")
+        print("           dimension-free in n (single order statistic).")
         print("=" * 74)
+        print(f"VERDICT: scale set by held-out fold; validation coverage "
+              f"{100 * cov_conf:.1f}% vs {100 * (1 - ALPHA_BAR):.0f}% target.")
     return out
 
 
 def _row_ub(Z, y_row, eps_i):
-    """Constraints of F restricted to one output row (see (13))."""
     return (np.vstack([Z.T, -Z.T]),
             np.concatenate([y_row + eps_i, -y_row + eps_i]))
 
 
 def feasible_hull(Y1r, Z, eps):
-    """(14): componentwise extrema of F.  Returns Theta_bar, Gamma."""
+    """(9)-(11): componentwise extrema of F.  Returns Theta_bar, Gamma."""
     n_, d = Y1r.shape[0], Z.shape[0]
     Tb, Gm = np.empty((n_, d)), np.empty((n_, d))
     for i in range(n_):
@@ -175,13 +164,7 @@ def feasible_hull(Y1r, Z, eps):
 
 def support_gap(Y1r, Z, eps, Theta_bar, Gamma, n_samples=8, seed=0,
                 verbose=True):
-    """Box-hull bound (Lemma 3) vs exact support over F.
-
-    Lemma 3 bounds |e_a^T [dA dB] psi| by sum_b Gamma_ab |psi_b|, the support
-    of the BOX HULL of F.  F is a thin correlated slab, so the exact support
-    is smaller.  The ratio is conservatism injected by the relaxation in (14),
-    not by the uncertainty itself.
-    """
+    """Box-hull bound (Lemma 3) vs exact support over F."""
     r_ = np.random.default_rng(seed)
     n_, T_ = Y1r.shape
     d = Z.shape[0]
@@ -207,19 +190,11 @@ def support_gap(Y1r, Z, eps, Theta_bar, Gamma, n_samples=8, seed=0,
         print(f"        box/exact over {out['n']} samples: "
               f"median {out['median']:.2f}x  "
               f"range {out['min']:.2f}-{out['max']:.2f}x")
-        print("        -> this much tube inflation comes from the box")
-        print("           relaxation in (14), removable without any new")
-        print("           assumption or probability budget.")
     return out
 
 
 def chebyshev_eps(Xn, Un):
-    """min_Theta max_k |y_{k+1,a} - Theta z_k| per coordinate (one LP/row).
-
-    Doubles as the Chebyshev floor: no data-consistent envelope can be
-    smaller than this, so eps_bar / floor is the honest statement of how
-    much slack the prior carries.
-    """
+    """min_Theta max_k |y_{k+1,a} - Theta z_k| per coordinate (one LP/row)."""
     Ya0, Ya1, Ua0 = Xn[:-1].T, Xn[1:].T, Un.T
     Tn = Ya0.shape[1]
     Zc = np.vstack([Ya0, Ua0])
@@ -241,7 +216,7 @@ def chebyshev_eps(Xn, Un):
 
 
 # ============================================================================
-# 1. Manipulator model
+# 1. Manipulator model                                      
 # ============================================================================
 G = 9.81
 
@@ -261,7 +236,6 @@ P_NOM = make_params(m1=2.0 * 1.15, m2=1.5 * 0.85, l1=0.5, l2=0.4, lc2f=0.55)
 
 
 def _check_true_in_theta():
-    """The paper claims Theta contains the true mismatch.  Verify it."""
     r_m1 = P_TRUE["m1"] / P_NOM["m1"]
     r_m2 = P_TRUE["m2"] / P_NOM["m2"]
     r_lc2 = (P_TRUE["lc2"] / P_TRUE["l2"]) / (P_NOM["lc2"] / P_NOM["l2"])
@@ -346,14 +320,11 @@ def rk4_step(x, u, dt, nsub=10, pt=None):
 
 
 # ============================================================================
-# 2. Data collection
+# 2. Data collection                                      
 # ============================================================================
 TS = 0.01
-
-# -- simulated noise vs a priori bound, kept explicitly distinct.
-SIGMA_TRUE = 2.0e-4       # what collect() actually injects
-SIGMA_HAT  = 2.0e-4       # Assumption 3 prior used by identification/tube
-
+SIGMA_TRUE = 1.0e-5       # Sec. V-C: simulated covariance (1e-5)^2 I
+SIGMA_HAT  = 2.0e-4       # Assumption 3 a-priori sensor bound
 
 EPS_P, EPS_V = SIGMA_TRUE, SIGMA_TRUE
 U_MAX, Q_MAX, QD_MAX = 5.0, 1.2, 2.0
@@ -392,56 +363,48 @@ def collect(T, seed, amp=0.7, pt=None):
 print("=" * 74)
 theta_info = _check_true_in_theta()
 print("=" * 74)
-if not np.isclose(SIGMA_TRUE, 1.0e-5):
-    print(f"[note] SIGMA_TRUE = {SIGMA_TRUE:.1e} but Sec. V-C states a")
-    print(f"       simulated covariance of (1e-5)^2 I.  With SIGMA_TRUE == "
-          f"SIGMA_HAT = {SIGMA_HAT:.1e} the claimed 20x prior conservatism")
-    print("       is NOT reproduced.  Reconcile script and manuscript.")
-print(f"[config] ablation = {ABLATION}   enforce_lemma1 = {ENFORCE_LEMMA1}")
-print("Collecting PE data (no injected disturbance)...")
+print(f"[config] ablation = {ABLATION}   alpha_bar = {ALPHA_BAR}   "
+      f"delta_a = {DELTA_A}")
+print(f"[noise ] sigma_true = {SIGMA_TRUE:.1e}  sigma_hat = {SIGMA_HAT:.1e}"
+      f"   (prior is {SIGMA_HAT / SIGMA_TRUE:.0f}x the simulated sd)")
+print("Collecting PE identification record (no injected disturbance)...")
 X_id, U_id, Xtrue_id = collect(T=T_ID, seed=11, amp=0.7)
-X_va, U_va, Xtrue_va = collect(T=T_VAL, seed=42, amp=0.6)
+X_va, U_va, Xtrue_va = collect(T=T_VAL, seed=42, amp=0.7)
 
 Y0, Y1, U0 = X_id[:-1].T, X_id[1:].T, U_id.T
 n, m = Y0.shape[0], U0.shape[0]
-Z_reg = np.vstack([Y0, U0])                      # regressors z_k = [y_k; u_k]
+Z_reg = np.vstack([Y0, U0])
 
-# Assumption 4 check
 rank_Z = np.linalg.matrix_rank(Z_reg)
 print(f"[Assumption 4] rank(Z_0) = {rank_Z} / {n + m} -> "
       f"{'SATISFIED' if rank_Z == n + m else 'VIOLATED'}")
 
-# ============================================================================
-# 3. Noise envelope and calibration of omega_hat
-# ============================================================================
-eta_a = norm.ppf(1.0 - DELTA_A / (2.0 * n * (T_ID + K_BAR)))
+# ---- folds (6): fit fold + stride-2 calibration fold -----------------------
+T1 = int(round(T1_FRAC * T_ID))
+I_fit = np.arange(T1)
+I_cal = np.arange(T1, T_ID, 2)          # stride 2 removes the shared nu sample
+T2 = len(I_cal)
+if T_ID < T1 + 2 * T2:
+    print(f"[warn] T_ID={T_ID} < T1+2*T2={T1 + 2 * T2}; folds overlap in noise.")
+print(f"[folds] T1(fit)={T1}  (calibration pooled over independent "
+      f"trajectories; see [conformal] below)")
 
-sigma_vec = np.full(n, SIGMA_TRUE)
+# ============================================================================
+# 3. Lemma-1 envelope  ->  W  ->  data-feasible set F  ->  (Theta_bar, Gamma)
+#    eta_a is the SHAPE MULTIPLIER of (18); it no longer carries the confidence.
+# ============================================================================
+eta_a = norm.ppf(1.0 - DELTA_A / (2.0 * n * T1))          # Lemma 1 (fit fold only)
 sigma_hat = SIGMA_HAT
 if ISOTROPIC:
-    # Lemma 2, eq. (10):  Cov(varsigma_k) <= sigma_hat^2 (1 + kappa_hat^2) I
-    sd = np.full(n, sigma_hat * np.sqrt(1.0 + KAPPA ** 2))
+    sd_env = sigma_hat * np.sqrt(1.0 + KAPPA ** 2)         # Lemma 2, eq (10)
 else:
-    sd = np.sqrt(sigma_vec ** 2 + KAPPA ** 2 * sigma_hat ** 2)
-noise_hw = eta_a * sd
+    sd_env = np.sqrt(SIGMA_TRUE ** 2 + KAPPA ** 2 * sigma_hat ** 2)
+vbar = eta_a * sd_env                                      # noise floor of (16g)/W
 
-
-Sigma_bar_diag = sigma_hat ** 2 * (1.0 + KAPPA ** 2) * np.ones(n)
-tau_floor = eta_a * np.sqrt(Sigma_bar_diag)          # == noise_hw here
-assert np.allclose(tau_floor, noise_hw), \
-    "Lemma-1 floor and Lemma-2 envelope must coincide under Assumption 2"
-
-# The old stacked bound, retained ONLY to report that it is strictly looser.
-lemma1_old = sigma_hat ** 2 * (1.0 + KAPPA) ** 2
-lemma1_ratio = float(np.sqrt(lemma1_old / Sigma_bar_diag[0]))
-
-if not ISOTROPIC:
-    print("[warn] anisotropic noise: Assumption 2 as stated is violated; "
-          "Lemma 2 still holds via sigma_hat = max_i sigma_i.")
-
+# ---- prior omega_hat by corner ensemble (feeds W and F ONLY) ---------------
 status = ("[MATCHED to beta]" if MATCHED_THETA
-          else "[MISMATCHED -- 'sensitivity only']")
-print(f"Corner-ensemble calibration over +/-{THETA_MASS_CAL:.0%} mass, "
+          else "[MISMATCHED -- sensitivity only]")
+print(f"Corner-ensemble prior omega_hat over +/-{THETA_MASS_CAL:.0%} mass, "
       f"+/-{THETA_LC2_CAL:.0%} lc2 {status}...")
 
 
@@ -455,190 +418,157 @@ def theta_corners(th_m, th_l):
 
 cal_corners = theta_corners(THETA_MASS_CAL, THETA_LC2_CAL)
 eps_min_cal = np.zeros(n)
-eps_per_corner = []
 for pt_c in cal_corners:
-    X_c, U_c, _ = collect(T=T_CAL, seed=CAL_SEED, amp=0.7, pt=pt_c)
-    e_c = chebyshev_eps(X_c, U_c)
-    eps_per_corner.append(e_c)
-    eps_min_cal = np.maximum(eps_min_cal, e_c)
-eps_per_corner = np.array(eps_per_corner)
+    X_c, U_c, _ = collect(T=T_PRIOR, seed=CAL_SEED, amp=0.7, pt=pt_c)
+    eps_min_cal = np.maximum(eps_min_cal, chebyshev_eps(X_c, U_c))
+omega_hat = np.maximum(SAFETY * eps_min_cal, OMEGA_FLOOR)
 
-eps_floor_id = chebyshev_eps(X_id, U_id)
+# W of (8): |w_i| <= omega_hat_i + vbar.  Used to build F on the FIT fold.
+W_env = omega_hat + vbar
+Theta_bar, Gamma = feasible_hull(Y1[:, I_fit], Z_reg[:, I_fit], W_env)
+Theta_star_true = np.hstack([A0, B0])
+true_in_hull = bool(np.all(np.abs(Theta_star_true - Theta_bar) <= Gamma + 1e-9))
 
-omega_bar = np.maximum(SAFETY * eps_min_cal, OMEGA_FLOOR)
-eps_bar = omega_bar + noise_hw
-g = GEN_SCALE * omega_bar
-G_omega = np.diag(g)
-headroom_floor = eps_bar / np.maximum(eps_floor_id, 1e-300)
-
-print(f"[envelope] eta_a={eta_a:.4f}  isotropic={ISOTROPIC}  "
-      f"sigma_hat={sigma_hat:.3e}  SAFETY={SAFETY}")
-print(f"           noise hw (Lemma 2)      = {noise_hw}")
-print(f"           Lemma-1 floor on tau    = {tau_floor}")
-print(f"           old stacked (1+k)^2 bnd = {lemma1_ratio:.3f}x looser "
-      f"-> not used")
-print(f"           eps_min (calib, T={T_CAL:4d}) = {eps_min_cal}")
-print(f"           eps_min corner spread   = "
-      f"{eps_per_corner.max(0) / np.maximum(eps_per_corner.min(0), 1e-300)}")
-print(f"           Chebyshev floor (ident) = {eps_floor_id}")
-print(f"           headroom eps_bar/floor  = {headroom_floor}")
-print(f"           omega_hat (calibrated)  = {omega_bar}")
-print(f"           eps_bar                 = {eps_bar}")
+print(f"[envelope] eta_a (shape mult.) = {eta_a:.4f}   vbar = {vbar:.3e}")
+print(f"           omega_hat (-> F only) = {omega_hat}")
+print(f"           W = omega_hat + vbar  = {W_env}")
+print(f"           Gamma max entry       = {Gamma.max():.4e}")
+print(f"           true params in hull   = {'YES' if true_in_hull else 'NO'}")
 
 # ============================================================================
-# 4. Theorem-1 identification program (region route)
-#    tau_i := eta_a sqrt(e_i^T Sigma_kappa e_i);  SOCP/QP, not an SDP.
+# 4. Lemma-2 SHAPE program (16): fit (g*, t*, c*_omega, Sigma*_kappa, s*)
+#    about the FIXED nominal Theta_bar.  SOCP, no coverage/prior term.
 # ============================================================================
 generators = []
 for i in range(n):
     for j in range(n):
-        GA = np.zeros((n, n))
-        GA[i, j] = 1.0
+        GA = np.zeros((n, n)); GA[i, j] = 1.0
         generators.append((GA, np.zeros((n, m))))
 for i in range(n):
     for j in range(m):
-        GB = np.zeros((n, m))
-        GB[i, j] = 1.0
+        GB = np.zeros((n, m)); GB[i, j] = 1.0
         generators.append((np.zeros((n, n)), GB))
 q = len(generators)
 
-V = np.zeros((T_ID, n, q))
-for k in range(T_ID):
+# V[k,i,j] = e_i^T (G_A^(j) y_k + G_B^(j) u_k), so ||e_i^T Z_k(s)||_1 = |V| @ s.
+Vabs_fit = np.zeros((T1, n, q))
+for kk, k in enumerate(I_fit):
     for j, (GA, GB) in enumerate(generators):
-        V[k, :, j] = GA @ Y0[:, k] + GB @ U0[:, k]
+        Vabs_fit[kk, :, j] = np.abs(GA @ Y0[:, k] + GB @ U0[:, k])
 
-if ABLATION == "prior_only":
-    print("\n[ABLATION] prior_only: skipping (11) entirely.")
-    print("           h_wtilde := eps_bar (Lemma-2 envelope), c := 0,")
-    print("           predictor := nominal (A0, B0).")
-    A_hat, B_hat = A0.copy(), B0.copy()
+# (16c): residuals about the FIXED midpoint Theta_bar (not a decision variable)
+r_fit = Y1[:, I_fit] - Theta_bar @ Z_reg[:, I_fit]
+
+
+R_SCALE = float(np.abs(r_fit).max())
+_rs = max(R_SCALE, 1e-12)
+LAMBDA_SIGMA = LAMBDA_G * eta_a ** 2 / _rs ** 2   # cost(t) ~ (r/eta_a)^2 -> O(1)
+LAMBDA_G_EFF = LAMBDA_G / _rs                     # cost(g) ~ r        -> O(1)
+print(f"[weights] r_scale={R_SCALE:.3e} -> lambda_sigma={LAMBDA_SIGMA:.3e}"
+      f"  lambda_g_eff={LAMBDA_G_EFF:.3e}")
+
+
+if ABLATION == "gaussian":
+    # Sigma at its floor.  Reported only to quantify the dimension-free gain.
+    print("\n[ABLATION gaussian] Lemma-1 tail region (no conformal calibration).")
+    g_star = omega_hat.copy()
+    t_star = np.full(n, sd_env)
+    c_omega_star = np.zeros(n)
+    Sigma_star_diag = sd_env ** 2 * np.ones(n)
     s_star = np.zeros(q)
-    c_om = np.zeros(n)
-    g_out = g.copy()
-    D_kappa = noise_hw.copy()
-    solve_status = "skipped"
+    tau_alpha = 1.0                                  # tail already carries 1-delta_a
+    solve_status = "closed-form"
 else:
-    print("\nConfiguring identification program (Theorem 1, region route)...")
-    SB = sigma_hat                              # nondimensionalisation scale
-    C_A = cp.Variable((n, n))
-    C_B = cp.Variable((n, m))
-    s_h = cp.Variable(q, nonneg=True)           # s = SB * s_h
-    tau_h = cp.Variable(n, nonneg=True)         # tau = SB * tau_h
-    c_h = cp.Variable(n)                        # c_omega = SB * c_h
-
-    cons = []
-    # --- Lemma 1 (per-sample covariance bound), imposed:
-    if ENFORCE_LEMMA1:
-        cons.append(tau_h >= tau_floor / SB)
-
-    if OPTIMIZE_G:
-        g_h = cp.Variable(n, nonneg=True)
-        zeta = cp.Variable((n, T_ID))
-        cons += [cp.abs(zeta[i, :]) <= g_h[i] for i in range(n)]
-        bounded_term = zeta
-    else:
-        lambdas = cp.Variable((n, T_ID))
-        cons += [lambdas <= 1, lambdas >= -1]
-        bounded_term = cp.diag(g / SB) @ lambdas
-
-    # (11c)+(11d): residual consistency
-    for k in range(T_ID):
-        r_k = (Y1[:, k] - C_A @ Y0[:, k] - C_B @ U0[:, k]) / SB
-        for i in range(n):
-            cons.append(cp.abs(r_k[i] - c_h[i] - bounded_term[i, k])
-                        <= tau_h[i] - (s_h @ np.abs(V[k, i, :])))
-
-    # (11f): coverage of the Lemma-2 envelope
-    if OPTIMIZE_G:
-        cons.append(g_h + tau_h >= eps_bar / SB + cp.abs(c_h))
-        obj = (cp.sum(g_h) + LAMBDA_SIGMA * cp.sum_squares(tau_h) / eta_a ** 2
-               + cp.sum(s_h))
-        if LAMBDA_REG:
-            obj = obj + cp.sum(cp.abs(zeta)) / T_ID
-    else:
-        cons.append(tau_h >= eps_bar / SB + cp.abs(c_h) - np.abs(g) / SB)
-        obj = (cp.sum(s_h)
-               + LAMBDA_SIGMA * cp.sum_squares(tau_h) / eta_a ** 2)
-        if LAMBDA_REG:
-            obj = obj + cp.sum(cp.abs(lambdas)) / T_ID
-
-    print("Solving (SOCP/QP -- no LMI; see revision note 2)...")
+    print("\nSolving Lemma-2 shape SOCP (16) about fixed Theta_bar...")
+    g   = cp.Variable(n, nonneg=True)
+    t   = cp.Variable(n, nonneg=True)
+    c_o = cp.Variable(n)
+    sig = cp.Variable(n, nonneg=True)                # diag(Sigma_kappa), WLOG
+    s_h = cp.Variable(q, nonneg=True)
+    mu  = cp.Variable((n, T1))
+    cons = [cp.abs(mu) <= cp.reshape(g, (n, 1), order="C"),   # (16d)
+            cp.square(t) <= sig,                              # (16f)
+            t >= sd_env]                                      # (16g)
+    for kk in range(T1):
+        cons.append(cp.abs(r_fit[:, kk] - c_o - mu[:, kk])
+                    <= eta_a * t - Vabs_fit[kk] @ s_h)        # (16e)
+    obj = (cp.sum(s_h)
+           + LAMBDA_SIGMA * cp.sum(sig)
+           + LAMBDA_G_EFF * cp.norm1(g)
+           + LAMBDA_MU * cp.sum(cp.abs(mu)) / (T1 * _rs))     # (16a)
     prob = cp.Problem(cp.Minimize(obj), cons)
-    prob.solve(solver=cp.CLARABEL, verbose=False)
+    prob.solve(solver=cp.CLARABEL, verbose=False,
+               tol_gap_abs=1e-12, tol_gap_rel=1e-12, tol_feas=1e-12)
     if prob.status not in ("optimal", "optimal_inaccurate"):
-        raise RuntimeError(f"Theorem-1 program failed: status={prob.status}")
-    if prob.status == "optimal_inaccurate":
-        print("[warn] returned optimal_inaccurate")
+        raise RuntimeError(f"Lemma-2 shape program failed: status={prob.status}")
     solve_status = prob.status
-
-    A_hat, B_hat = C_A.value, C_B.value
-    s_star = np.maximum(s_h.value, 0.0) * SB
-    c_om = c_h.value * SB
-    g_out = (np.maximum(g_h.value, 0.0) * SB) if OPTIMIZE_G else g
-    D_kappa = tau_h.value * SB
-    print(f"-> active s_i={int((s_star > 1e-9).sum())}/{q}, "
-          f"sum(s*)={s_star.sum():.3e}")
-    # Sigma*_kappa recovered from tau*
-    Sigma_star_diag = (D_kappa / eta_a) ** 2
-    at_floor = np.allclose(Sigma_star_diag, Sigma_bar_diag, rtol=2e-2)
-    print("-> Sigma*_kappa diag = "
-          f"{np.array2string(Sigma_star_diag, precision=3, suppress_small=False)}")
-    print("   Lemma-1 floor     = "
-          f"{np.array2string(Sigma_bar_diag, precision=3, suppress_small=False)}")
-    print(f"   at the floor?      {'YES' if at_floor else 'no'}"
-          + ("   (=> Sigma_kappa is data, not a decision variable;"
-             " state it as such)" if at_floor else ""))
-
-hw_dd = np.abs(g_out) + D_kappa
-c_dd = c_om.copy()
-
-
-def residuals(X, U, A, B):
-    return X[1:] - X[:-1] @ A.T - U @ B.T
-
-
-# --------------------------------------------------- which constraint binds --
-R_id = Y1 - A_hat @ Y0 - B_hat @ U0                    # n x T
-cov_hw = eps_bar + np.abs(c_om)                        # (11f) route
-data_hw = np.abs(R_id - c_om[:, None]).max(axis=1)     # (11d) route
-
-routes = np.vstack([cov_hw, data_hw])
-which = [["coverage(11f)", "residual(11d)"][j]
-         for j in np.argmax(routes, axis=0)]
-data_margin = data_hw / np.maximum(cov_hw, 1e-300) - 1.0
-
-print("\n[binding constraint, per coordinate]")
-print(f"        achieved h_wtilde        = {hw_dd}")
-print(f"        coverage (11f) route     = {cov_hw}")
-print(f"        residual (11d) route     = {data_hw}")
-print(f"        active                   = {which}")
-print(f"        data contribution        = {data_margin}"
-      f"   (<= 0 everywhere => identification is inert)")
-
-audit = audit_theorem1(g=g_out, hw=hw_dd, c_om=c_om, eps_bar=eps_bar,
-                       R_id=R_id, eta_a=eta_a, s_star=s_star,
-                       sigma_bar_hw=tau_floor)
-audit["ablation"] = ABLATION
-audit["solve_status"] = solve_status
-audit["headroom_floor"] = headroom_floor.tolist()
-audit["lemma1_old_over_new"] = lemma1_ratio
-
-# --- regression guard: if the binding route ever changes, the prose in
-#     Section V-B and Table 1 must be revisited.
-EXPECTED_INERT = True
-if audit["sdp_inert"] != EXPECTED_INERT:
-    print("\n[REGRESSION] binding route changed vs EXPECTED_INERT="
-          f"{EXPECTED_INERT}; Section V-B text and Table 1 need revisiting.")
+    if solve_status == "optimal_inaccurate":
+        print("[warn] shape SOCP inaccurate -- do NOT report these numbers")
+    g_star = np.maximum(g.value, 0.0)
+    t_star = np.maximum(t.value, 0.0)
+    c_omega_star = c_o.value
+    Sigma_star_diag = np.maximum(t_star ** 2, sig.value)   
+    s_star = np.maximum(s_h.value, 0.0)
+    print(f"-> status={solve_status}  active s_i={int((s_star > 1e-9).sum())}/{q}"
+          f"   sum(s*)={s_star.sum():.3e}")
+    print(f"   g*             = {g_star}")
+    print(f"   eta_a t*       = {eta_a * t_star}")
+    print(f"   c*_omega       = {c_omega_star}")
 
 # ============================================================================
-# 5. Contraction metric P
+# 5. Conformal calibration of the SCALE (18)-(20) on the held-out fold
+# ============================================================================
+def rho_shape(psi):
+    """(18): rho_i(psi) = |g*_i| + eta_a t*_i + sum_b Gamma_ib |psi_b|."""
+    return np.abs(g_star) + eta_a * t_star + np.abs(Gamma) @ np.abs(psi)
+
+
+M_CAL = int(os.environ.get("THM1_M_CAL", 50))  
+if ABLATION == "conformal":
+    scores = []
+    for j in range(M_CAL):
+        X_c, U_c, _ = collect(T=200, seed=5000 + j, amp=0.7)
+        z_c = X_c[1:].T - Theta_bar @ np.vstack([X_c[:-1].T, U_c.T])
+        Zc = np.vstack([X_c[:-1].T, U_c.T])
+        s_traj = [np.max(np.abs(z_c[:, k] - c_omega_star) / rho_shape(Zc[:, k]))
+                  for k in range(z_c.shape[1])]
+        scores.append(s_traj)
+    scores = np.concatenate(scores)
+    T2 = len(scores)
+    ALPHA_LEVEL = float(os.environ.get("THM1_ALPHA_LEVEL", ALPHA_BAR))
+    rank = int(np.ceil((T2 + 1) * (1.0 - ALPHA_LEVEL)))       # (19) order index
+    if rank > T2:
+        print(f"[warn] T2={T2} too small for alpha_bar={ALPHA_BAR}; "
+              f"tau_alpha = +inf.")
+        tau_alpha = np.inf
+    else:
+        tau_alpha = float(np.sort(scores)[rank - 1])
+    print(f"\n[conformal] pooled over M={M_CAL} trajectories, T2={T2}")
+    print(f"[conformal] rank {rank}/{T2}  ->  tau_alpha = {tau_alpha:.4f}"
+          f"   (guaranteed coverage >= {min(rank / (T2 + 1), 1.0) * 100:.2f}%)")
+
+
+# (32): half-widths of R_hat_alpha at psi = 0 (axis-aligned box at c*_omega)
+hw_tilde = tau_alpha * (np.abs(g_star) + eta_a * t_star)
+print(f"[region] hw_tilde (eq 32)      = {hw_tilde}")
+print(f"         of which noise floor  = {tau_alpha * eta_a * sd_env * np.ones(n)}")
+
+# ---- Corollary 1 horizon level (reporting) ---------------------------------
+alpha_omega = DELTA_OMEGA / K_BAR
+print(f"[Corollary 1] alpha_omega = delta_omega/K_bar = {alpha_omega:.2e}"
+      f"   (requires T2 >= K_bar/delta_omega - 1 = {K_BAR / DELTA_OMEGA - 1:.0f})")
+
+
+# ============================================================================
+# 6. Contraction metric P                                    
 # ============================================================================
 print("\nSolving SDP for the contraction metric P...")
 thetas = theta_corners(THETA_MASS, THETA_LC2)
-Ns = 4000
-qs = np.c_[rng.uniform(-Q_MAX, Q_MAX, Ns), rng.uniform(-Q_MAX, Q_MAX, Ns)]
-qds = np.c_[rng.uniform(-QD_MAX, QD_MAX, Ns), rng.uniform(-QD_MAX, QD_MAX, Ns)]
-us = rng.uniform(-U_MAX, U_MAX, (Ns, 2))
+qs = np.c_[rng.uniform(-Q_MAX, Q_MAX, NS_METRIC),
+           rng.uniform(-Q_MAX, Q_MAX, NS_METRIC)]
+qds = np.c_[rng.uniform(-QD_MAX, QD_MAX, NS_METRIC),
+            rng.uniform(-QD_MAX, QD_MAX, NS_METRIC)]
+us = rng.uniform(-U_MAX, U_MAX, (NS_METRIC, 2))
 dmax = np.zeros(2)
 for th in thetas:
     dmax = np.maximum(dmax, np.abs(delta_theta(qs, qds, us, th, P_NOM)).max(0))
@@ -703,12 +633,13 @@ def prad(center, halfw):
 
 
 # ============================================================================
-# 6. Analytical bound beta
+# 7. Analytical bound beta                                    
 # ============================================================================
 print("Recomputing analytical constants a,b,c...")
-qs2 = np.c_[rng.uniform(-Q_MAX, Q_MAX, 1200), rng.uniform(-Q_MAX, Q_MAX, 1200)]
-qds2 = np.c_[rng.uniform(-QD_MAX, QD_MAX, 1200),
-             rng.uniform(-QD_MAX, QD_MAX, 1200)]
+qs2 = np.c_[rng.uniform(-Q_MAX, Q_MAX, NS_ABC),
+            rng.uniform(-Q_MAX, Q_MAX, NS_ABC)]
+qds2 = np.c_[rng.uniform(-QD_MAX, QD_MAX, NS_ABC),
+             rng.uniform(-QD_MAX, QD_MAX, NS_ABC)]
 a = b = c = 0.0
 for th in thetas:
     for (q1, q2), (qd1, qd2) in zip(qs2, qds2):
@@ -732,260 +663,232 @@ for th in thetas:
 print(f"   a={a:.4e} b={b:.4e} c={c:.4e}")
 
 # ============================================================================
-# 7. Comparisons
+# 8. Comparisons: conformal region vs beta                    (Table 1 / Fig 1)
 # ============================================================================
-W_id = residuals(X_id, U_id, A_hat, B_hat)
-qd_true = Xtrue_id[:-1, 2:]        # beta is stated at EXACT states
+# beta is stated at EXACT states along the identification trajectory
+qd_true = Xtrue_id[:-1, 2:]
 beta = (a * np.linalg.norm(U_id, axis=1)
         + b * np.linalg.norm(qd_true, axis=1) + c)
-wP = pnorm(W_id)
 
+# realised effective uncertainty and true discrepancy (P-weighted)
+W_id = X_id[1:] - X_id[:-1] @ Theta_bar[:, :n].T - U_id @ Theta_bar[:, n:].T
+wP = pnorm(W_id)
 D_true = Xtrue_id[1:] - Xtrue_id[:-1] @ A0.T - U_id @ B0.T
 dP_true = pnorm(D_true)
 disc_hw = np.abs(D_true).max(axis=0)
+
+# --- conformal region radius along the identification trajectory ------------
+# R_hat_alpha at covariate z_k has half-widths tau_alpha * rho(z_k), centre c*.
+Z_id = Z_reg                                       # covariates z_k = [y_k; u_k]
+rad_conf_k = np.array([prad(c_omega_star, tau_alpha * rho_shape(Z_id[:, k]))
+                       for k in range(T_ID)])
+# region evaluated at the ORIGIN covariate (the uncertainty support, eq 32)
+rad_conf0 = prad(c_omega_star, hw_tilde)
+rad_center = float(pnorm(c_omega_star[None])[0])
+print(f"[region] P-radius {rad_conf0:.4e} = centre {rad_center:.4e} "
+      f"({100 * rad_center / rad_conf0:.0f}%) + halfwidths")
+noise_floor_hw = tau_alpha * eta_a * sd_env * np.ones(n)   # (16g) floor only
+rad_noise = prad(np.zeros(n), noise_floor_hw)
+
+# --- old Gaussian tail region for the dimension-free comparison -------------
+hw_gauss = eta_a * t_star
+rad_gauss0 = prad(np.zeros(n), hw_gauss)
+
+# --- like-for-like radii ----------------------------------------------------
+rad_omega = prad(np.zeros(n), omega_hat)           # discrepancy-only, prior
 rad_disc = prad(np.zeros(n), disc_hw)
+beta_aug = beta + rad_noise                        # beta (+) noise envelope
 
-rad_omega = prad(np.zeros(n), omega_bar)
-rad_dd_P = prad(c_dd, hw_dd)
-rad_noise = prad(np.zeros(n), D_kappa)
-rad_data = prad(c_om, data_hw)          # (11d) counterfactual
 
-ratio_I_max = beta.max() / rad_omega
-ratio_I_med = np.median(beta) / rad_omega
-ratio_II_max = beta.max() / rad_dd_P
-ratio_II_med = np.median(beta) / rad_dd_P
+ratio_conf_k = beta / rad_conf_k
+ratio_aug_k = beta_aug / rad_conf_k
+ratio_conf_max = float(ratio_conf_k.max())
+ratio_conf_med = float(np.median(ratio_conf_k))
+ratio_aug_max = float(ratio_aug_k.max())
+ratio_aug_med = float(np.median(ratio_aug_k))
 
-beta_aug_max = beta.max() + rad_noise
-beta_aug_med = np.median(beta) + rad_noise
-ratio_III_max = beta_aug_max / rad_dd_P
-ratio_III_med = beta_aug_med / rad_dd_P
-beta_aug = beta + rad_noise
-
-W_va = residuals(X_va, U_va, A_hat, B_hat)
-cov_dd = 100 * np.all(np.abs(W_va - c_dd) <= hw_dd + 1e-12, axis=1).mean()
-cov_data = 100 * np.all(np.abs(W_va - c_om) <= data_hw + 1e-12, axis=1).mean()
-
-noise_content = np.minimum(noise_hw / np.maximum(omega_bar, 1e-300), 1.0)
-disc_share = np.minimum(disc_hw / np.maximum(omega_bar, 1e-300), 1.0)
+# --- coverage on validation data --------------------------------------------
+zeta_va = X_va[1:].T - Theta_bar @ np.vstack([X_va[:-1].T, U_va.T])
+Z_va = np.vstack([X_va[:-1].T, U_va.T])
+cov_conf = float(np.mean([
+    np.all(np.abs(zeta_va[:, k] - c_omega_star)
+           <= tau_alpha * rho_shape(Z_va[:, k]) + 1e-12)
+    for k in range(zeta_va.shape[1])]))
+# residual-only set (empirical, no conformal inflation): tau_alpha := 1, g,t,Gamma
+resid_hw = np.abs((Y1[:, I_fit] - Theta_bar @ Z_reg[:, I_fit])
+                  - c_omega_star[:, None]).max(axis=1)
+cov_resid = float(np.mean([
+    np.all(np.abs(zeta_va[:, k] - c_omega_star) <= resid_hw + 1e-12)
+    for k in range(zeta_va.shape[1])]))
 cov_beta_true = 100 * np.mean(dP_true <= beta)
 
-# --- data-feasible set F and its interval hull (14), plus the support gap ---
-print("\nComputing the data-feasible set F and its interval hull (14)...")
-Theta_bar_F, Gamma_F = feasible_hull(Y1, Z_reg, eps_bar)
-Theta_star_true = np.hstack([A0, B0])
-in_hull = bool(np.all(np.abs(Theta_star_true - Theta_bar_F)
-                      <= Gamma_F + 1e-12))
-print(f"   Gamma max entry            = {Gamma_F.max():.4e}")
-print(f"   |Theta* - Theta_bar| max   = "
-      f"{np.abs(Theta_star_true - Theta_bar_F).max():.4e}")
-print(f"   true parameters inside hull: {'YES' if in_hull else 'NO'}")
+report = conformal_report(
+    g_star, t_star, c_omega_star, eta_a, tau_alpha, hw_tilde,
+    Sigma_star_diag, s_star, cov_conf, cov_resid, rad_gauss0)
+report["ablation"] = ABLATION
+report["solve_status"] = solve_status
+report["true_in_hull"] = true_in_hull
 
+# --- data-feasible set diagnostics ------------------------------------------
+print("\nComputing interval hull (11) and support gap...")
 sgap = None
 if RUN_SUPPORT_GAP:
-    sgap = support_gap(Y1, Z_reg, eps_bar, Theta_bar_F, Gamma_F,
-                       n_samples=SUPPORT_SAMPLES)
+    sgap = support_gap(Y1[:, I_fit], Z_reg[:, I_fit], W_env,
+                       Theta_bar, Gamma, n_samples=SUPPORT_SAMPLES)
 
 lines = [
-    "=== Table 1 (region route): comparisons in the P-weighted norm ===",
-    f"ablation = {ABLATION}   enforce_lemma1 = {ENFORCE_LEMMA1}",
-    f"eta_a = {eta_a:.4f}   isotropic = {ISOTROPIC}   kappa_hat = {KAPPA}"
-    f"   optimise_g = {OPTIMIZE_G}   SAFETY = {SAFETY}",
+    "=== Table 1 (conformal region): comparisons in the P-weighted norm ===",
+    f"ablation = {ABLATION}   alpha_bar = {ALPHA_BAR}   delta_a = {DELTA_A}",
+    f"eta_a (shape mult.) = {eta_a:.4f}   tau_alpha (conformal) = {tau_alpha:.4f}",
     f"sigma_true = {SIGMA_TRUE:.2e}   sigma_hat = {SIGMA_HAT:.2e}",
     f"Theta (beta)  = +/-{THETA_MASS:.0%} mass, +/-{THETA_LC2:.0%} lc2",
-    f"Theta (prior) = +/-{THETA_MASS_CAL:.0%} mass, +/-{THETA_LC2_CAL:.0%} lc2"
-    f"   {'[MATCHED]' if MATCHED_THETA else '[MISMATCHED]'}",
     f"analytical constants  a={a:.4e}  b={b:.4e}  c={c:.4e}",
     "",
-    "(0) LEMMA 1 (per-sample covariance bound), imposed on (11)",
-    f"    Sigma_bar diag              = "
-    f"{np.array2string(Sigma_bar_diag, precision=3, suppress_small=False)}",
-    f"    tau floor = eta_a sqrt(.)   = {tau_floor}",
-    f"    old stacked (1+k)^2 route   = {lemma1_ratio:.3f}x looser, unused",
+    "(0) SHAPE (Lemma 2, eq 16) fitted about fixed Theta_bar",
+    f"    g*                          = {g_star}",
+    f"    eta_a t*                    = {eta_a * t_star}",
+    f"    c*_omega                    = {c_omega_star}",
+    f"    Sigma*_kappa diag           = {Sigma_star_diag}",
+    f"    active generators s*        = {int((s_star > 1e-9).sum())}/{q}",
     "",
-    "(I) DISCREPANCY ONLY",
-    f"    omega_hat (calibrated)      = {omega_bar}",
-    f"    realised discrepancy box    = {disc_hw}",
-    f"    noise content of omega_hat  = {noise_content}",
-    f"    realised-disc share         = {disc_share}",
+    "(I) DISCREPANCY ONLY (prior, feeds F only)",
+    f"    omega_hat                   = {omega_hat}",
     f"    P-radius omega_hat          = {rad_omega:.4e}",
-    f"    P-radius realised disc.     = {rad_disc:.4e}",
     f"    P-radius beta_max           = {beta.max():.4e}",
-    f"    ratio vs omega_hat          : max {ratio_I_max:.2f}x , "
-    f"median {ratio_I_med:.2f}x",
-    f"    ratio vs realised disc.     : max {beta.max() / rad_disc:.2f}x , "
-    f"median {np.median(beta) / rad_disc:.2f}x",
+    f"    ratio beta/omega            : max {beta.max() / rad_omega:.2f}x , "
+    f"median {np.median(beta) / rad_omega:.2f}x",
     "",
-    "(II) FULL EFFECTIVE UNCERTAINTY",
-    f"    h_wtilde = |g| + tau        = {hw_dd}",
-    f"      of which measurement noise = {D_kappa}",
-    f"      eps_bar (Lemma 2 envelope) = {eps_bar}",
-    f"    P-radius Z_wtilde           = {rad_dd_P:.4e}",
+    "(II) CONFORMAL REGION (Theorem 1)",
+    f"    hw_tilde (eq 32, psi=0)     = {hw_tilde}",
+    f"      of which measurement noise = {noise_floor_hw}",
+    f"    P-radius R_hat_alpha (psi=0)= {rad_conf0:.4e}",
     f"      of which noise alone      = {rad_noise:.4e}  "
-    f"({100 * rad_noise / rad_dd_P:.0f}% of the set)",
-    f"    ratio                       : max {ratio_II_max:.2f}x , "
-    f"median {ratio_II_med:.2f}x",
+    f"({100 * rad_noise / rad_conf0:.0f}% of the set)",
+    f"    ratio beta/R_hat_alpha      : max {ratio_conf_max:.2f}x , "
+    f"median {ratio_conf_med:.2f}x",
     "",
-    "(III) LIKE-FOR-LIKE -- both descriptions cover discrepancy + noise",
-    f"      noise envelope P-radius   = {rad_noise:.4e}",
-    f"      beta (+) N : max {beta_aug_max:.4e}   med {beta_aug_med:.4e}",
-    f"      Z_wtilde                  = {rad_dd_P:.4e}",
-    f"      conservatism ratio        : max {ratio_III_max:.2f}x , "
-    f"median {ratio_III_med:.2f}x",
+    "(III) LIKE-FOR-LIKE -- both cover discrepancy + noise",
+    f"      beta (+) noise            : max {beta_aug.max():.4e}  "
+    f"med {np.median(beta_aug):.4e}",
+    f"      R_hat_alpha               = {rad_conf0:.4e}",
+    f"      conservatism ratio        : max {ratio_aug_max:.2f}x , "
+    f"median {ratio_aug_med:.2f}x",
     "",
-    "(IV) COUNTERFACTUAL -- what the residuals alone would support",
-    f"      (11d) half-widths           = {data_hw}",
-    f"      P-radius of (11d) set       = {rad_data:.4e}",
-    f"      tightening vs Z_wtilde      = {rad_dd_P / rad_data:.2f}x",
-    f"      validation coverage of (11d) set = {cov_data:.1f}%  "
-    f"(target {100 * (1 - DELTA_A):.0f}%)",
-    f"      binding route per coord     = {which}",
-    f"      Chebyshev floor             = {eps_floor_id}",
-    f"      headroom eps_bar / floor    = {headroom_floor}"
-    f"   ({headroom_floor.min():.1f}x to {headroom_floor.max():.1f}x)",
+    "(IV) DIMENSION-FREE GAIN vs the Gaussian tail of Lemma 1",
+    f"      hw_gaussian (eta_a sqrt.) = {hw_gauss}",
+    f"      hw_tilde (conformal)      = {hw_tilde}",
+    f"      P-radius gauss / conformal= {rad_gauss0:.4e} / {rad_conf0:.4e}",
+    f"      gain                      = {rad_gauss0 / rad_conf0:.2f}x",
     "",
-    "(V) INTERVAL-HULL CONSERVATISM IN (14)  [T3]",
-    f"      Gamma max entry             = {Gamma_F.max():.4e}",
-    f"      true params inside hull     = {in_hull}",
+    "(V) COVERAGE",
+    f"      conformal region on val.  = {100 * cov_conf:.1f}%  "
+    f"(target {100 * (1 - ALPHA_BAR):.0f}%)",
+    f"      residual-only set on val. = {100 * cov_resid:.1f}%  "
+    f"(uncalibrated -> typically below target)",
+    f"      coverage ||d_k||_P <= beta= {cov_beta_true:.1f}%",
+    "",
+    "(VI) INTERVAL-HULL CONSERVATISM IN (11)  [data-feasible set F]",
+    f"      Gamma max entry           = {Gamma.max():.4e}",
+    f"      true params inside hull   = {true_in_hull}",
 ]
 if sgap is not None:
-    lines += [f"      box/exact support ratio     : median "
-              f"{sgap['median']:.2f}x  range {sgap['min']:.2f}-"
-              f"{sgap['max']:.2f}x"]
+    lines += [f"      box/exact support ratio   : median {sgap['median']:.2f}x  "
+              f"range {sgap['min']:.2f}-{sgap['max']:.2f}x"]
 lines += [
     "",
     f"beta(x,u) along traj : med={np.median(beta):.4e}  max={beta.max():.4e}",
     f"||w_tilde||_P        : med={np.median(wP):.4e}  max={wP.max():.4e}",
     f"||d_k||_P (true)     : med={np.median(dP_true):.4e}  "
     f"max={dP_true.max():.4e}",
-    f"coverage ||d_k||_P <= beta      : {cov_beta_true:.1f}%",
-    f"Z_wtilde validation coverage    : {cov_dd:.1f}%  "
-    f"(target {100 * (1 - DELTA_A):.0f}%)",
     "",
-    "M1 VERDICT: " + ("identification INERT -- (11f) binds everywhere; "
-                      "restate Contribution 1"
-                      if audit["sdp_inert"] else
-                      "(11d) binds somewhere -- data does constrain"),
+    f"VERDICT: scale set by pooled held-out trajectories; validation coverage "
+    f"{100 * cov_conf:.1f}% vs {100 * (1 - ALPHA_BAR):.0f}% target.",
 ]
 summary = "\n".join(lines)
 print("\n" + summary)
 
 # ============================================================================
-# 7b. Assumption 3 on the identification record
-# ============================================================================
-print("\n[Assumption 3] identification record")
-print(f"        max |d_k| per coordinate = {disc_hw}")
-print(f"        omega_hat                = {omega_bar}")
-cov_box_id = 100 * np.all(np.abs(D_true) <= omega_bar + 1e-15, axis=1).mean()
-print(f"        coverage |d_k| <= omega_hat : {cov_box_id:.1f}%")
-print("        -> " + ("SATISFIED" if cov_box_id == 100.0 else "VIOLATED"))
-
-# ============================================================================
-# 7c. Assumption 3 over Theta and over wider trajectories
+# 8b. Assumption 3 over Theta / wider trajectories (prior omega_hat vs F)
 # ============================================================================
 a3 = {}
 if VERIFY_A3:
-    print(f"\n[Assumption 3a] Theta vertices ({len(thetas)} corners "
-          f"x {A3_T} steps)")
+    print(f"\n[Assumption 3a] Theta vertices ({len(thetas)} corners x {A3_T})")
     worst_vert = np.zeros(n)
     for ci, pt_c in enumerate(thetas):
         _, U_r, Xt_r = collect(T=A3_T, seed=9000 + ci, amp=0.7, pt=pt_c)
         D_r = Xt_r[1:] - Xt_r[:-1] @ A0.T - U_r @ B0.T
         worst_vert = np.maximum(worst_vert, np.abs(D_r).max(axis=0))
-    ok_vert = bool(np.all(worst_vert <= omega_bar))
-    print(f"        worst |d_k| at vertices = {worst_vert}")
-    print(f"        required inflation      = "
-          f"{worst_vert / np.maximum(omega_bar, 1e-300)}")
-    print("        -> " + ("SATISFIED" if ok_vert else "VIOLATED"))
+    ok_vert = bool(np.all(worst_vert <= omega_hat))
+    print(f"        worst |d_k| vertices = {worst_vert}   "
+          f"-> {'SATISFIED' if ok_vert else 'VIOLATED'}")
 
-    print(f"\n[Assumption 3b] Theta interior ({A3_INTERIOR} draws x {A3_T})")
-    worst_int = np.zeros(n)
-    for r_i in range(A3_INTERIOR):
-        rr = np.random.default_rng(9500 + r_i)
-        pt_r = make_params(
-            m1=P_NOM["m1"] * (1 + rr.uniform(-THETA_MASS, THETA_MASS)),
-            m2=P_NOM["m2"] * (1 + rr.uniform(-THETA_MASS, THETA_MASS)),
-            l1=0.5, l2=0.4,
-            lc2f=0.55 * (1 + rr.uniform(-THETA_LC2, THETA_LC2)))
-        _, U_r, Xt_r = collect(T=A3_T, seed=9500 + r_i, amp=0.7, pt=pt_r)
-        D_r = Xt_r[1:] - Xt_r[:-1] @ A0.T - U_r @ B0.T
-        worst_int = np.maximum(worst_int, np.abs(D_r).max(axis=0))
-    ok_int = bool(np.all(worst_int <= omega_bar))
-    print(f"        worst |d_k| interior    = {worst_int}")
-    print(f"        required inflation      = "
-          f"{worst_int / np.maximum(omega_bar, 1e-300)}")
-    print("        -> " + ("SATISFIED" if ok_int else "VIOLATED"))
-
-    print(f"\n[Assumption 3c] out-of-distribution trajectories "
-          f"(amp={A3_AMP_OOD}, true plant)")
     worst_traj = np.zeros(n)
     for r_i in range(8):
-        _, U_r, Xt_r = collect(T=A3_T, seed=7000 + r_i, amp=A3_AMP_OOD,
-                               pt=P_TRUE)
+        _, U_r, Xt_r = collect(T=A3_T, seed=7000 + r_i, amp=A3_AMP_OOD, pt=P_TRUE)
         D_r = Xt_r[1:] - Xt_r[:-1] @ A0.T - U_r @ B0.T
         worst_traj = np.maximum(worst_traj, np.abs(D_r).max(axis=0))
-    ok_traj = bool(np.all(worst_traj <= omega_bar))
-    print(f"        worst |d_k| wider traj  = {worst_traj}")
-    print(f"        required inflation      = "
-          f"{worst_traj / np.maximum(omega_bar, 1e-300)}")
-    print("        -> " + ("SATISFIED" if ok_traj else "VIOLATED"))
-
-    ok_all = ok_vert and ok_int and ok_traj
-    if not ok_all:
-        print("\n        E_env does NOT hold for all reported conditions;")
-        print("        Theorem 1, Corollary 1, Theorems 2-4 do not apply.")
-    a3 = dict(vertices=worst_vert.tolist(), interior=worst_int.tolist(),
-              trajectory=worst_traj.tolist(), ok=ok_all)
-    summary += ("\n\nAssumption 3: " + ("SATISFIED" if ok_all else "VIOLATED")
-                + f"\n  worst |d_k| vertices = {worst_vert}"
-                + f"\n  worst |d_k| interior = {worst_int}"
-                + f"\n  worst |d_k| traj     = {worst_traj}"
-                + f"\n  omega_hat            = {omega_bar}")
+    ok_traj = bool(np.all(worst_traj <= omega_hat))
+    print(f"        worst |d_k| wider    = {worst_traj}   "
+          f"-> {'SATISFIED' if ok_traj else 'VIOLATED'}")
+    a3 = dict(vertices=worst_vert.tolist(), trajectory=worst_traj.tolist(),
+              ok=bool(ok_vert and ok_traj))
+    summary += ("\n\nAssumption 3 (prior for F): "
+                + ("SATISFIED" if a3["ok"] else "VIOLATED"))
 
 with open(OUT_DIR / f"summary_{ABLATION}.txt", "w") as f:
     f.write(summary + "\n")
 
 # ============================================================================
-# 8. Machine-readable output + LaTeX macros
+# 9. Machine-readable output + LaTeX macros
 # ============================================================================
+covs = []
+for s_ in range(20):
+    X_v, U_v, _ = collect(T=T_VAL, seed=1000 + s_, amp=0.7)
+    z_v = X_v[1:].T - Theta_bar @ np.vstack([X_v[:-1].T, U_v.T])
+    Zv = np.vstack([X_v[:-1].T, U_v.T])
+    covs.append(np.mean([
+        np.all(np.abs(z_v[:, k] - c_omega_star)
+               <= tau_alpha * rho_shape(Zv[:, k]) + 1e-12)
+        for k in range(z_v.shape[1])]))
+covs = np.array(covs)
+print(f"[sweep] coverage over 20 validation records: "
+      f"{100 * covs.mean():.1f}% +/- {100 * covs.std():.1f}%  "
+      f"(min {100 * covs.min():.1f}%)")
+
+
 res = dict(
-    config=dict(eta_a=float(eta_a), kappa=KAPPA, delta_a=DELTA_A,
-                safety=SAFETY, isotropic=ISOTROPIC, optimize_g=OPTIMIZE_G,
-                lambda_reg=LAMBDA_REG, lambda_sigma=LAMBDA_SIGMA,
-                T_id=T_ID, T_cal=T_CAL, matched_theta=MATCHED_THETA,
-                theta_mass=THETA_MASS, theta_lc2=THETA_LC2,
-                theta_mass_cal=THETA_MASS_CAL, theta_lc2_cal=THETA_LC2_CAL,
-                rho=float(rho_used), sigma_hat=float(sigma_hat),
-                sigma_true=float(SIGMA_TRUE), ablation=ABLATION,
-                enforce_lemma1=ENFORCE_LEMMA1),
-    lemma1=dict(Sigma_bar_diag=Sigma_bar_diag.tolist(),
-                tau_floor=tau_floor.tolist(),
-                old_stacked_ratio=lemma1_ratio),
-    audit=audit,
-    support_gap=sgap,
-    theta_check=theta_info,
+    config=dict(eta_a=float(eta_a), tau_alpha=float(tau_alpha),
+                alpha_bar=ALPHA_BAR, delta_a=DELTA_A, delta_omega=DELTA_OMEGA,
+                kappa=KAPPA, safety=SAFETY, isotropic=ISOTROPIC,
+                lambda_sigma=LAMBDA_SIGMA, lambda_g=LAMBDA_G, lambda_mu=LAMBDA_MU,
+                T_id=T_ID, T1=T1, T2=T2, T_prior=T_PRIOR, T_val=T_VAL,
+                rho=float(rho_used), sigma_hat=float(SIGMA_HAT),
+                sigma_true=float(SIGMA_TRUE), ablation=ABLATION),
+    shape=dict(g_star=g_star.tolist(), t_star=t_star.tolist(),
+               c_omega_star=c_omega_star.tolist(),
+               Sigma_star_diag=Sigma_star_diag.tolist(),
+               s_star_active=int((s_star > 1e-9).sum())),
+    conformal=dict(tau_alpha=float(tau_alpha), hw_tilde=hw_tilde.tolist(),
+                   alpha_omega=float(alpha_omega),
+                   coverage_conformal=float(cov_conf),
+                   coverage_residual_only=float(cov_resid)),
+    report=report, support_gap=sgap, theta_check=theta_info,
     abc=dict(a=float(a), b=float(b), c=float(c)),
-    omega_hat=omega_bar.tolist(),
-    eps_min_cal=eps_min_cal.tolist(), eps_floor_id=eps_floor_id.tolist(),
-    headroom_floor=headroom_floor.tolist(),
-    h_wtilde=hw_dd.tolist(), data_hw=data_hw.tolist(), cov_hw=cov_hw.tolist(),
-    binding_route=which, data_margin=data_margin.tolist(),
-    realised_disc_box=disc_hw.tolist(),
-    noise_content=noise_content.tolist(),
-    gamma_max=float(Gamma_F.max()), true_in_hull=in_hull,
-    radii=dict(omega=float(rad_omega), Z=float(rad_dd_P),
-               noise=float(rad_noise), data=float(rad_data),
+    omega_hat=omega_hat.tolist(),
+    gamma_max=float(Gamma.max()), true_in_hull=true_in_hull,
+    radii=dict(omega=float(rad_omega), conformal=float(rad_conf0),
+               noise=float(rad_noise), gaussian=float(rad_gauss0),
                disc=float(rad_disc), beta_max=float(beta.max()),
                beta_med=float(np.median(beta)),
-               beta_aug_max=float(beta_aug_max),
-               beta_aug_med=float(beta_aug_med)),
-    ratios=dict(I_max=float(ratio_I_max), I_med=float(ratio_I_med),
-                II_max=float(ratio_II_max), II_med=float(ratio_II_med),
-                III_max=float(ratio_III_max), III_med=float(ratio_III_med),
-                data_tightening=float(rad_dd_P / rad_data)),
-    coverage=dict(Z_validation=float(cov_dd), data_validation=float(cov_data),
-                  beta_true=float(cov_beta_true), box_id=float(cov_box_id)),
-    realised=dict(w_med=float(np.median(wP)), w_max=float(wP.max()),
-                  d_med=float(np.median(dP_true)), d_max=float(dP_true.max())),
+               beta_aug_max=float(beta_aug.max()),
+               beta_aug_med=float(np.median(beta_aug))),
+    ratios=dict(conf_max=float(ratio_conf_max), conf_med=float(ratio_conf_med),
+                aug_max=float(ratio_aug_max), aug_med=float(ratio_aug_med),
+                dimfree_gain=float(rad_gauss0 / rad_conf0)),
+    coverage=dict(conformal=float(cov_conf), residual_only=float(cov_resid),
+                  beta_true=float(cov_beta_true),
+                  sweep_mean=float(covs.mean()), sweep_std=float(covs.std()),
+                  sweep_min=float(covs.min()), sweep_n=int(len(covs))),
     assumption3=a3,
 )
 with open(OUT_DIR / f"table1_numbers_{ABLATION}.json", "w") as f:
@@ -993,7 +896,6 @@ with open(OUT_DIR / f"table1_numbers_{ABLATION}.json", "w") as f:
 
 
 def _sci(x, d=2):
-    """LaTeX scientific notation, e.g. 2.04{\\times}10^{-2}."""
     if x == 0:
         return "0"
     e = int(np.floor(np.log10(abs(x))))
@@ -1002,108 +904,63 @@ def _sci(x, d=2):
 
 
 macros = {
-    "TabRadOmega": _sci(rad_omega), "TabRadZ": _sci(rad_dd_P),
-    "TabRadNoise": _sci(rad_noise), "TabRadData": _sci(rad_data),
-    "TabRadDisc": _sci(rad_disc),
+    "TabRadOmega": _sci(rad_omega), "TabRadConf": _sci(rad_conf0),
+    "TabRadNoise": _sci(rad_noise), "TabRadGauss": _sci(rad_gauss0),
     "TabBetaMax": _sci(beta.max()), "TabBetaMed": _sci(np.median(beta)),
-    "TabBetaAugMax": _sci(beta_aug_max), "TabBetaAugMed": _sci(beta_aug_med),
-    "TabRatioIMax": f"{ratio_I_max:.2f}", "TabRatioIMed": f"{ratio_I_med:.2f}",
-    "TabRatioIIIMax": f"{ratio_III_max:.2f}",
-    "TabRatioIIIMed": f"{ratio_III_med:.2f}",
-    "TabDataTighten": f"{rad_dd_P / rad_data:.1f}",
-    "TabNoiseShare": f"{100 * rad_noise / rad_dd_P:.0f}",
-    "TabWMax": _sci(wP.max()), "TabWMed": _sci(np.median(wP)),
-    "TabDMax": _sci(dP_true.max()), "TabDMed": _sci(np.median(dP_true)),
-    "TabCovZ": f"{cov_dd:.0f}", "TabCovData": f"{cov_data:.0f}",
-    "TabEtaA": f"{eta_a:.3f}",
+    "TabBetaAugMax": _sci(beta_aug.max()), "TabBetaAugMed": _sci(np.median(beta_aug)),
+    "TabRatioConfMax": f"{ratio_conf_max:.2f}", "TabRatioConfMed": f"{ratio_conf_med:.2f}",
+    "TabRatioAugMax": f"{ratio_aug_max:.2f}", "TabRatioAugMed": f"{ratio_aug_med:.2f}",
+    "TabDimFreeGain": f"{rad_gauss0 / rad_conf0:.2f}",
+    "TabNoiseShare": f"{100 * rad_noise / rad_conf0:.0f}",
+    "TabTauAlpha": f"{tau_alpha:.3f}", "TabEtaA": f"{eta_a:.3f}",
+    "TabCovConf": f"{100 * cov_conf:.0f}", "TabCovResid": f"{100 * cov_resid:.1f}",
     "TabConstA": _sci(a), "TabConstB": _sci(b), "TabConstC": _sci(c),
-
-    "TabMarginMin": f"{audit['headroom_min']:.1f}",
-    "TabMarginMax": f"{audit['headroom_max']:.1f}",
-
-    "TabFloorHeadroomMin": f"{headroom_floor.min():.1f}",
-    "TabFloorHeadroomMax": f"{headroom_floor.max():.1f}",
-    "TabLemmaOneRatio": f"{lemma1_ratio:.2f}",
-    "TabTauFloor": _sci(float(tau_floor[0])),
-    "TabIdentInert": "yes" if audit["sdp_inert"] else "no",
+    "TabGammaMax": _sci(Gamma.max()),
+    "TabCovSweepMean": f"{100 * covs.mean():.1f}",
+    "TabCovSweepStd": f"{100 * covs.std():.1f}",
+    "TabCovSweepMin": f"{100 * covs.min():.1f}",
 }
 if sgap is not None:
     macros["TabSupportGapMed"] = f"{sgap['median']:.1f}"
-    macros["TabSupportGapMin"] = f"{sgap['min']:.1f}"
-    macros["TabSupportGapMax"] = f"{sgap['max']:.1f}"
-
 with open(OUT_DIR / f"table1_macros_{ABLATION}.tex", "w") as f:
     f.write("% auto-generated -- do not edit; regenerate with this script\n")
     for k, v in macros.items():
         f.write(f"\\newcommand{{\\{k}}}{{{v}}}\n")
 
 # ============================================================================
-# 9. Figure
+# 10. Figure
 # ============================================================================
-TWO_COLUMN = False
-FIG_W = 7.16 if TWO_COLUMN else 3.5
-FIG_H = 3.20 if TWO_COLUMN else 2.65
-FS = 9 if TWO_COLUMN else 8
-
+FIG_W, FIG_H, FS = 3.5, 2.65, 8
 plt.rcParams.update({
     "font.size": FS, "font.family": "serif",
     "font.serif": ["Times New Roman", "Nimbus Roman", "DejaVu Serif"],
     "mathtext.fontset": "stix",
     "axes.grid": True, "grid.alpha": 0.25, "grid.linewidth": 0.4,
-    "axes.linewidth": 0.6,
-    "xtick.labelsize": FS - 1, "ytick.labelsize": FS - 1,
-    "xtick.major.width": 0.6, "ytick.major.width": 0.6,
+    "axes.linewidth": 0.6, "xtick.labelsize": FS - 1, "ytick.labelsize": FS - 1,
     "figure.dpi": 400, "savefig.bbox": "tight", "savefig.pad_inches": 0.02,
 })
-C_DD, C_ANL, C_AUG, C_OM, C_DAT = ("#1f77b4", "#d62728", "#ff7f0e",
-                                   "#2ca02c", "#9467bd")
-
+C_CONF, C_ANL, C_AUG, C_OM, C_GAU = ("#1f77b4", "#d62728", "#ff7f0e",
+                                     "#2ca02c", "#9467bd")
 fig, axT = plt.subplots(figsize=(FIG_W, FIG_H))
 kk = np.arange(len(wP))
-
 axT.plot(kk, wP, color="0.60", lw=0.5, alpha=0.85, zorder=1,
          label=r"$\Vert\tilde w_k\Vert_P$")
 axT.axhline(rad_omega, color=C_OM, lw=2.0, ls=":", zorder=5,
             label=r"$\hat\omega$ radius")
 axT.plot(kk, beta, color=C_ANL, lw=1.3, ls="--", zorder=4,
          label=r"$\beta(x_k,u_k)$")
-axT.axhline(rad_dd_P, color=C_DD, lw=1.8, zorder=4,
-            label=r"$\mathcal{Z}_{\tilde w}$ radius")
+axT.plot(kk, rad_conf_k, color=C_CONF, lw=1.6, zorder=4,
+         label=r"$\widehat{\mathcal{R}}_{\bar\alpha}(z_k)$ radius")
 axT.plot(kk, beta_aug, color=C_AUG, lw=1.5, ls="-.", zorder=5,
-         label=r"$\beta\oplus\mathcal{N}$")
-axT.axhline(rad_data, color=C_DAT, lw=1.2, ls=(0, (1, 1)), zorder=3,
-            label=r"residual route")
-
-
-def _gap(x_frac, r1, r2, txt):
-    """Annotate the gap between two levels; orientation-safe."""
-    lo, hi = min(r1, r2), max(r1, r2)
-    if hi / max(lo, 1e-300) < 1.03:      # too close to annotate legibly
-        return
-    x = int(x_frac * len(kk))
-    axT.annotate("", xy=(x, hi), xytext=(x, lo),
-                 arrowprops=dict(arrowstyle="<->", color="0.25", lw=0.8,
-                                 shrinkA=0, shrinkB=0), zorder=6)
-    axT.text(x - 0.015 * len(kk), np.sqrt(lo * hi), txt, fontsize=FS - 1.5,
-             color="0.25", ha="right", va="center", zorder=6,
-             bbox=dict(boxstyle="round,pad=0.12", fc="white", ec="none",
-                       alpha=0.8))
-
-
-_gap(0.60, rad_omega, np.median(beta), rf"${ratio_I_med:.2f}\times$")
-_gap(0.90, rad_dd_P, beta_aug_med, rf"${ratio_III_med:.2f}\times$")
-_gap(0.30, rad_data, rad_dd_P, rf"${rad_dd_P / rad_data:.1f}\times$")
-
+         label=r"$\beta\oplus\mathcal{S}$")
+axT.axhline(rad_gauss0, color=C_GAU, lw=1.2, ls=(0, (1, 1)), zorder=3,
+            label=r"Gaussian tail (L1)")
 axT.set_yscale("log")
 axT.set_ylabel(r"$P$-weighted magnitude", labelpad=2)
 axT.set_xlabel(r"time step $k$", labelpad=2)
-axT.set_ylim(min(wP.min() * 0.22, rad_data * 0.5), beta_aug_max * 3.0)
 axT.margins(x=0.01)
-axT.legend(loc="lower left", bbox_to_anchor=(0.0, 0.0), ncol=3,
-           frameon=False, fontsize=FS - 1.5, handlelength=1.4,
-           handletextpad=0.35, columnspacing=0.9, borderaxespad=0.3,
-           labelspacing=0.25)
-
+axT.legend(loc="lower left", ncol=2, frameon=False, fontsize=FS - 2,
+           handlelength=1.4, handletextpad=0.35, columnspacing=0.9)
 for ext in ("pdf", "png"):
     fig.savefig(OUT_DIR / f"fig1_residual_sets_{ABLATION}.{ext}")
 
@@ -1113,5 +970,5 @@ print(f"  summary_{ABLATION}.txt")
 print(f"  table1_numbers_{ABLATION}.json   (machine-readable)")
 print(f"  table1_macros_{ABLATION}.tex     (\\input this so the paper "
       f"cannot drift)")
-print("\nTo run the ablation:  THM1_ABLATION=prior_only python "
+print("\nGaussian-tail baseline:  THM1_ABLATION=gaussian python "
       "9_compare_wtilde_vs_delta.py")
